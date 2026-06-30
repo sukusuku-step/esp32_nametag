@@ -67,5 +67,4 @@ python -m platformio device monitor
 
 ## 補足
 
-- `ble_send` の PlatformIO 環境名は `m5stack-cores3`
-- `m5` の PlatformIO 環境名も `m5stack-cores3`
+- PlatformIO 環境名は `m5stack-cores3`
