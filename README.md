@@ -1,17 +1,8 @@
-# procon26 mvp
+# sukusute-esp32_nametag
 
-このリポジトリは、M5Stack を使った BLE 連携の試作プロジェクトです。`ble_send` と `m5` はどちらもプロトタイプであり、実装や仕様は今後変更される前提です。
+このリポジトリは、esp32を使ったIoT名札デバイスです。
 
 ## 構成
-
-### `ble_send`
-
-M5Stack CoreS3 で動作する送信側プロトタイプです。`M5_BEACON` という名前で BLE Beacon を広告し、受信側が RSSI を使って距離の目安を取得できるようにしています。
-
-- 対象ボード: M5Stack CoreS3
-- PlatformIO 環境: `m5stack-cores3`
-- 主な役割: BLE Beacon の広告送信
-- 表示: 起動状態を簡易表示
 
 ### `m5`
 
@@ -19,7 +10,7 @@ M5Stack CoreS3 で動作する受信側プロトタイプです。BLE Beacon を
 
 - 対象ボード: M5Stack CoreS3
 - PlatformIO 環境: `m5stack-cores3`
-- 主な役割: BLE 受信、歩数計測、CSV ログ保存
+- 主な役割: BLE 送受信、歩数計測、CSV ログ保存
 - 補足: `M5Unified` を使用しています
 
 ## PlatformIO の使い方
