@@ -1,9 +1,14 @@
 #include <M5Unified.h>
 #include <BLEDevice.h>
 #include <BLEScan.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <BLEAdvertising.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
 #include <SD.h>
 #include <time.h>
+#include "cert.h"
 
 #define DEVICE_ID "NODE01"
 
@@ -361,6 +366,57 @@ void setup()
         &bleTaskHandle,
         1
     );
+
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    while( WiFi.status() != WL_CONNECTED) {
+        delay(500); 
+        M5.Lcd.print("."); 
+    }
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.println("WiFi connected");
+    M5.Lcd.print("IP address = ");
+    M5.Lcd.println(WiFi.localIP());
+}
+
+//HTTPリクエスト
+void sendDataToServer(int  time , int stepCount, float distanceSnapshot) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(API_URL);
+    http.addHeader("Content-Type", "application/json");
+
+    // JSON 作成
+    StaticJsonDocument<200> doc;
+    doc["time"] = time;
+    doc["deviceId"]  = stepCount;
+    doc["distance"] = distanceSnapshot;
+
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+
+    int httpResponseCode = http.POST(jsonStr);
+
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      M5.Lcd.fillScreen(BLACK);
+      M5.Lcd.setTextColor(WHITE, BLACK);
+      M5.Lcd.setCursor(0, 0);
+      M5.Lcd.println("HTTP Response code: " + String(httpResponseCode));
+      M5.Lcd.println("Response: " + response);
+
+      if (httpResponseCode == 200) {
+        M5.Lcd.println("Register Confirmed");
+        delay(1000);
+      }
+ 
+    } else {
+      M5.Lcd.println("Error on sending POST: " + String(httpResponseCode));
+    }
+
+    http.end();
+  } else {
+    M5.Lcd.println("WiFi not connected!");
+  }
 }
 
 // =========================
@@ -486,6 +542,12 @@ void loop()
             &sharedStateMux);
 
         saveDataToCSV(
+            now / 1000,
+            stepCount,
+            distanceSnapshot
+        );
+
+        sendDataToServer(
             now / 1000,
             stepCount,
             distanceSnapshot
