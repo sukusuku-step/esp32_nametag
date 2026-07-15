@@ -24,7 +24,7 @@ portMUX_TYPE sharedStateMux = portMUX_INITIALIZER_UNLOCKED;
 volatile int stepCount = 0;
 
 // =========================
-// BLE
+// BLE（相対距離）
 // =========================
 volatile int latestRSSI = -100;
 volatile float distanceMeter = -1;
@@ -50,10 +50,9 @@ unsigned long lastCSVMillis = 0;
 const unsigned long CSV_INTERVAL = 10000;
 
 // =========================
-// SD
+// SDカードの初期化
 // =========================
-void initSDCard()
-{
+void initSDCard() {
     if (!SD.begin(4)) {
         Serial.println("SD card initialization failed");
         return;
@@ -62,8 +61,7 @@ void initSDCard()
     Serial.println("SD card initialized");
 }
 
-void createNewCSVFile()
-{
+void createNewCSVFile() {
     time_t now = time(nullptr);
     struct tm* timeinfo = localtime(&now);
 
@@ -80,7 +78,6 @@ void createNewCSVFile()
     File file = SD.open(csvFileName, FILE_WRITE);
 
     if (file) {
-
         file.println("Timestamp,Steps,Distance(m)");
         file.close();
 
@@ -91,30 +88,83 @@ void createNewCSVFile()
     }
 }
 
-void saveDataToCSV(unsigned long timestamp, int steps, float distance)
-{
+// =========================
+// CSVへのデータの書き込み
+// =========================
+void saveDataToCSV(unsigned long timestamp, int steps, float distance) {
     if (csvFileName[0] == '\0')
         return;
 
     File file = SD.open(csvFileName, FILE_APPEND);
 
     if (file) {
-        file.printf(
-            "%lu,%d,%.2f\n",
-            timestamp,
-            steps,
-            distance
-        );
-
+        file.printf("%lu,%d,%.2f\n", timestamp, steps, distance);
         file.close();
     }
 }
 
 // =========================
+// 歩数計算
+// =========================
+void updateStepCount() {
+    static float gravity = 1.0f;
+    static float filtered = 0.0f;
+    static float prevFiltered = 0.0f;
+    static bool rising = false;
+    static unsigned long lastStepMillis = 0;
+    static bool calibrated = false;
+
+    const float ALPHA = 0.92f;
+    const float STEP_THRESHOLD = 0.18f;
+    const unsigned long STEP_INTERVAL = 300;
+
+    if (!calibrated) {
+        for (int i = 0; i < 40; i++) {
+            float ax, ay, az;
+
+            M5.Imu.getAccelData(&ax, &ay, &az);
+
+            float accelMagnitude =
+                sqrt(ax * ax + ay * ay + az * az);
+
+            gravity = gravity * 0.9f + accelMagnitude * 0.1f;
+
+            delay(20);
+        }
+
+        calibrated = true;
+    }
+
+    float ax, ay, az;
+
+    M5.Imu.getAccelData(&ax, &ay, &az);
+
+    float accelMagnitude = sqrt(ax * ax + ay * ay + az * az);
+
+    gravity = gravity * ALPHA + accelMagnitude * (1.0f - ALPHA);
+    filtered = accelMagnitude - gravity;
+
+    bool currentRising = filtered > prevFiltered;
+
+    if (rising && !currentRising && prevFiltered > STEP_THRESHOLD) {
+        unsigned long now = millis();
+
+        if (now - lastStepMillis > STEP_INTERVAL) {
+            stepCount++;
+            lastStepMillis = now;
+
+            Serial.printf("STEP %d\n", stepCount);
+        }
+    }
+
+    rising = currentRising;
+    prevFiltered = filtered;
+}
+
+// =========================
 // 距離計算
 // =========================
-float calculateDistance(int rssi)
-{
+float calculateDistance(int rssi) {
     int txPower = -59;
 
     if (rssi == 0)
@@ -132,8 +182,7 @@ float calculateDistance(int rssi)
 // =========================
 // ノード更新
 // =========================
-void updateDevice(String id, int rssi)
-{
+void updateDevice(String id, int rssi) {
     float distance = calculateDistance(rssi);
 
     for (int i = 0; i < deviceCount; i++) {
@@ -161,8 +210,7 @@ void updateDevice(String id, int rssi)
 // BLE callback
 // =========================
 class MyCallbacks : public BLEAdvertisedDeviceCallbacks {
-    void onResult(BLEAdvertisedDevice device)
-    {
+    void onResult(BLEAdvertisedDevice device) {
         String name = device.getName().c_str();
 
         if (!name.startsWith("NODE") || name == DEVICE_ID)
@@ -187,11 +235,9 @@ class MyCallbacks : public BLEAdvertisedDeviceCallbacks {
 // =========================
 // BLE task
 // =========================
-void bleTask(void *arg)
-{
+void bleTask(void *arg) {
     while (true) {
         pBLEScan->start(1, false);
-
         pBLEScan->clearResults();
 
         vTaskDelay(200 / portTICK_PERIOD_MS);
@@ -201,8 +247,7 @@ void bleTask(void *arg)
 // =========================
 // UI描画
 // =========================
-void drawUI()
-{
+void drawUI() {
     M5.Display.fillScreen(TFT_NAVY);
     M5.Display.setTextColor(WHITE);
     M5.Display.setTextSize(5);
@@ -236,10 +281,9 @@ void drawUI()
 }
 
 // =========================
-// setup
+// デバイスのセットアップ
 // =========================
-void setup()
-{
+void setup() {
     auto cfg = M5.config();
 
     cfg.serial_baudrate = 115200;
@@ -290,8 +334,24 @@ void setup()
     M5.Lcd.println("WiFi connected");
     M5.Lcd.print("IP address = ");
     M5.Lcd.println(WiFi.localIP()); // デバイスのローカルIPアドレス
+
+    // Wi-Fi接続後
+    configTime(9 * 3600, 0, "pool.ntp.org", "ntp.jst.mfeed.ad.jp");
+
+    struct tm timeinfo;
+
+    // 同期完了まで待つ
+    while (!getLocalTime(&timeinfo)) {
+        Serial.println("NTP同期待ち...");
+        delay(500);
+    }
+
+    Serial.println("NTP同期完了");
 }
 
+// =========================
+// Wi-Fi経由のデータ送信
+// =========================
 void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot) {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi not connected!");
@@ -351,82 +411,24 @@ void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot
     }
 
     http.end();
+}
 
-    // WiFi接続後
-    configTime(9 * 3600, 0, "pool.ntp.org", "ntp.jst.mfeed.ad.jp");
+// =========================
+// child_idの取得
+// =========================
+int getChildId(char* device_name) {
+    // DBから児童の名前に対応したidを照合する
 
-    // 同期完了まで待つ
-    struct tm timeinfo;
-    while (!getLocalTime(&timeinfo)) {
-        Serial.println("NTP同期待ち...");
-        delay(500);
-    }
-    Serial.println("NTP同期完了");
+    return 1;
 }
     
 // =========================
-// loop
+// メインループ
 // =========================
-void loop()
-{
-    static float gravity = 1.0f;
-    static float filtered = 0.0f;
-    static float prevFiltered = 0.0f;
+void loop() {
+    updateStepCount(); // 歩数計算
 
-    static bool rising = false;
-
-    static unsigned long lastStepMillis = 0;
-
-    static unsigned long lastUI = 0;
-
-    static bool calibrated = false;
-
-    const float ALPHA = 0.92f;
-    const float STEP_THRESHOLD = 0.18f;
-    const unsigned long STEP_INTERVAL = 300;
-
-    if (!calibrated) {
-        for (int i = 0; i < 40; i++) {
-            float ax, ay, az;
-
-            M5.Imu.getAccelData(&ax, &ay, &az);
-
-            float accelMagnitude =
-                sqrt(ax * ax + ay * ay + az * az);
-
-            gravity = gravity * 0.9f + accelMagnitude * 0.1f;
-
-            delay(20);
-        }
-
-        calibrated = true;
-    }
-
-    float ax, ay, az;
-
-    M5.Imu.getAccelData(&ax, &ay, &az);
-
-    float accelMagnitude = sqrt(ax * ax + ay * ay + az * az);
-
-    gravity = gravity * ALPHA + accelMagnitude * (1.0f - ALPHA);
-    filtered = accelMagnitude - gravity;
-
-    bool currentRising = filtered > prevFiltered;
-
-    if (rising && !currentRising && prevFiltered > STEP_THRESHOLD) {
-        unsigned long now = millis();
-
-        if (now - lastStepMillis > STEP_INTERVAL) {
-            stepCount++;
-            lastStepMillis = now;
-
-            Serial.printf("STEP %d\n", stepCount);
-        }
-    }
-
-    rising = currentRising;
-    prevFiltered = filtered;
-
+    unsigned long lastUI = 0;
     unsigned long now = millis();
 
     if (now - lastCSVMillis > CSV_INTERVAL) {
