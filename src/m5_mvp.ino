@@ -10,14 +10,15 @@
 #include <time.h>
 #include "cert.h"
 
-#define DEVICE_ID "NODE01"
+#define DEVICE_ID "YUUKI" // 児童の名前（デバイスごとに変える）
 
 BLEScan* pBLEScan;
 BLEAdvertising* pAdvertising;
 TaskHandle_t bleTaskHandle;
 
 portMUX_TYPE sharedStateMux = portMUX_INITIALIZER_UNLOCKED;
-const char* API_URL = "http://10.10.1.87:8000/api/push_data";// =========================
+
+// =========================
 // 歩数
 // =========================
 volatile int stepCount = 0;
@@ -73,7 +74,8 @@ void createNewCSVFile()
             timeinfo->tm_mday,
             timeinfo->tm_hour,
             timeinfo->tm_min,
-            timeinfo->tm_sec);
+            timeinfo->tm_sec
+        );
 
     File file = SD.open(csvFileName, FILE_WRITE);
 
@@ -89,19 +91,14 @@ void createNewCSVFile()
     }
 }
 
-void saveDataToCSV(
-    unsigned long timestamp,
-    int steps,
-    float distance)
+void saveDataToCSV(unsigned long timestamp, int steps, float distance)
 {
     if (csvFileName[0] == '\0')
         return;
 
-    File file =
-        SD.open(csvFileName, FILE_APPEND);
+    File file = SD.open(csvFileName, FILE_APPEND);
 
     if (file) {
-
         file.printf(
             "%lu,%d,%.2f\n",
             timestamp,
@@ -123,32 +120,23 @@ float calculateDistance(int rssi)
     if (rssi == 0)
         return -1;
 
-    float ratio =
-        rssi * 1.0 / txPower;
+    float ratio = rssi * 1.0 / txPower;
 
     if (ratio < 1.0) {
-
         return pow(ratio, 10);
     }
 
-    return
-        0.89976 *
-        pow(ratio, 7.7095)
-        + 0.111;
+    return 0.89976 * pow(ratio, 7.7095) + 0.111; // 信号強度計算
 }
 
 // =========================
 // ノード更新
 // =========================
-void updateDevice(
-    String id,
-    int rssi)
+void updateDevice(String id, int rssi)
 {
-    float distance =
-        calculateDistance(rssi);
+    float distance = calculateDistance(rssi);
 
     for (int i = 0; i < deviceCount; i++) {
-
         if (devices[i].id == id) {
 
             devices[i].rssi = rssi;
@@ -160,7 +148,6 @@ void updateDevice(
     }
 
     if (deviceCount < 20) {
-
         devices[deviceCount].id = id;
         devices[deviceCount].rssi = rssi;
         devices[deviceCount].distance = distance;
@@ -173,44 +160,27 @@ void updateDevice(
 // =========================
 // BLE callback
 // =========================
-class MyCallbacks :
-    public BLEAdvertisedDeviceCallbacks {
-
-    void onResult(
-        BLEAdvertisedDevice device)
+class MyCallbacks : public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice device)
     {
-        String name =
-            device.getName().c_str();
+        String name = device.getName().c_str();
 
-        if (!name.startsWith("NODE"))
+        if (!name.startsWith("NODE") || name == DEVICE_ID)
             return;
 
-        if (name == DEVICE_ID)
-            return;
-
-        int rssi =
-            device.getRSSI();
-
-        float distance =
-            calculateDistance(rssi);
+        int rssi = device.getRSSI();
+        float distance = calculateDistance(rssi);
 
         updateDevice(name, rssi);
 
-        portENTER_CRITICAL(
-            &sharedStateMux);
+        portENTER_CRITICAL(&sharedStateMux);
 
         latestRSSI = rssi;
         distanceMeter = distance;
 
-        portEXIT_CRITICAL(
-            &sharedStateMux);
+        portEXIT_CRITICAL(&sharedStateMux);
 
-        Serial.printf(
-            "%s RSSI=%d Dist=%.2f\n",
-            name.c_str(),
-            rssi,
-            distance
-        );
+        Serial.printf("%s RSSI=%d Dist=%.2f\n", name.c_str(), rssi, distance);
     }
 };
 
@@ -220,86 +190,49 @@ class MyCallbacks :
 void bleTask(void *arg)
 {
     while (true) {
-
-        pBLEScan->start(
-            1,
-            false
-        );
+        pBLEScan->start(1, false);
 
         pBLEScan->clearResults();
 
-        vTaskDelay(
-            200 / portTICK_PERIOD_MS
-        );
+        vTaskDelay(200 / portTICK_PERIOD_MS);
     }
 }
 
 // =========================
-// UI
+// UI描画
 // =========================
 void drawUI()
 {
-    M5.Display.fillScreen(
-        TFT_NAVY);
-
-    M5.Display.setTextColor(
-        WHITE);
-
+    M5.Display.fillScreen(TFT_NAVY);
+    M5.Display.setTextColor(WHITE);
     M5.Display.setTextSize(5);
-
     M5.Display.setCursor(20, 20);
     M5.Display.println(DEVICE_ID);
-
     M5.Display.setTextSize(3);
-
     M5.Display.setCursor(20, 90);
 
-    M5.Display.printf(
-        "STEP: %d",
-        stepCount
-    );
+    M5.Display.printf("STEP: %d", stepCount);
 
     int y = 140;
 
     M5.Display.setTextSize(2);
 
     for (int i = 0; i < deviceCount; i++) {
-
-        if (
-            millis()
-            - devices[i].lastSeen
-            > 10000)
+        if (millis() - devices[i].lastSeen > 10000)
             continue;
 
-        M5.Display.setCursor(
-            20,
-            y
-        );
-
-        M5.Display.printf(
-            "%s %.1fm",
-            devices[i].id.c_str(),
-            devices[i].distance
-        );
+        M5.Display.setCursor(20, y);
+        M5.Display.printf("%s %.1fm", devices[i].id.c_str(), devices[i].distance);
 
         y += 25;
     }
 
-    int battery =
-        M5.Power.getBatteryLevel();
+    int battery = M5.Power.getBatteryLevel();
 
-    M5.Display.setTextColor(
-        TFT_YELLOW);
+    M5.Display.setTextColor(TFT_YELLOW);
+    M5.Display.setCursor(M5.Display.width() - 110, M5.Display.height() - 30);
 
-    M5.Display.setCursor(
-        M5.Display.width() - 110,
-        M5.Display.height() - 30
-    );
-
-    M5.Display.printf(
-        "%d%%",
-        battery
-    );
+    M5.Display.printf("%d%%", battery);
 }
 
 // =========================
@@ -324,48 +257,30 @@ void setup()
     createNewCSVFile();
 
     // BLE
-    BLEDevice::init(
-        DEVICE_ID
-    );
+    BLEDevice::init(DEVICE_ID);
 
     // Advertising
-    pAdvertising =
-        BLEDevice::getAdvertising();
+    pAdvertising = BLEDevice::getAdvertising();
 
     BLEAdvertisementData advData;
 
-    advData.setName(
-        DEVICE_ID
-    );
+    advData.setName(DEVICE_ID);
 
-    pAdvertising->setAdvertisementData(
-        advData
-    );
+    pAdvertising->setAdvertisementData(advData);
 
     pAdvertising->start();
+    
+    pBLEScan = BLEDevice::getScan(); // Scan
 
-    // Scan
-    pBLEScan =
-        BLEDevice::getScan();
-
-    pBLEScan->setAdvertisedDeviceCallbacks(
-        new MyCallbacks()
-    );
+    pBLEScan->setAdvertisedDeviceCallbacks(new MyCallbacks());
 
     pBLEScan->setActiveScan(true);
     pBLEScan->setInterval(100);
     pBLEScan->setWindow(80);
 
-    xTaskCreatePinnedToCore(
-        bleTask,
-        "BLE",
-        4096,
-        NULL,
-        2,
-        &bleTaskHandle,
-        1
-    );
+    xTaskCreatePinnedToCore(bleTask, "BLE", 4096, NULL, 2, &bleTaskHandle, 1);
 
+    // Wi-Fiへの接続を行う
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     while( WiFi.status() != WL_CONNECTED) {
         delay(500); 
@@ -374,76 +289,81 @@ void setup()
     M5.Lcd.fillScreen(BLACK);
     M5.Lcd.println("WiFi connected");
     M5.Lcd.print("IP address = ");
-    M5.Lcd.println(WiFi.localIP());
+    M5.Lcd.println(WiFi.localIP()); // デバイスのローカルIPアドレス
 }
 
 void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot) {
-        if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("WiFi not connected!");
-            return;
-        }
-
-        // ISOタイムスタンプ生成
-        time_t now = time(nullptr);
-        struct tm* t = gmtime(&now);
-        char isoTime[32];
-        sprintf(isoTime, "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
-            t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-            t->tm_hour, t->tm_min, t->tm_sec);
-
-        // JSON組み立て（512バイトに拡張）
-        StaticJsonDocument<512> doc;
-        doc["child_id"] = 1;
-
-        // singledata
-        JsonObject singledata = doc.createNestedObject("singledata");
-        singledata["date"] = isoTime;
-        singledata["steps"] = steps;
-
-        // distances（近くにいるデバイス分だけ追加）
-        JsonArray distances = doc.createNestedArray("distances");
-        for (int i = 0; i < deviceCount; i++) {
-            if (millis() - devices[i].lastSeen > 10000) continue; // 10秒以上見えないはスキップ
-            JsonObject dist = distances.createNestedObject();
-            dist["date"] = isoTime;
-            // NODExx の数字部分をwith_childとして使う
-            dist["with_child"] = String(devices[i].id).substring(4).toInt();
-            dist["distance"] = devices[i].distance;
-        }
-
-        String jsonStr;
-        serializeJson(doc, jsonStr);
-        Serial.println("Sending: " + jsonStr);
-
-        HTTPClient http;
-        http.begin(API_URL);
-        http.addHeader("Content-Type", "application/json");
-
-        int httpResponseCode = http.POST(jsonStr);
-
-        if (httpResponseCode > 0) {
-            Serial.println("HTTP Response: " + String(httpResponseCode));
-            String response = http.getString();
-            Serial.println("Response: " + response);
-        } else {
-            Serial.println("Error: " + String(httpResponseCode));
-        }
-
-        http.end();
-
-                // WiFi接続後
-        configTime(9 * 3600, 0, "pool.ntp.org", "ntp.jst.mfeed.ad.jp");
-
-        // 同期完了まで待つ
-        struct tm timeinfo;
-        while (!getLocalTime(&timeinfo)) {
-            Serial.println("NTP同期待ち...");
-            delay(500);
-        }
-        Serial.println("NTP同期完了");
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi not connected!");
+        return;
     }
-    
 
+    // ISOタイムスタンプ生成
+    time_t now = time(nullptr);
+    struct tm* t = gmtime(&now);
+    char isoTime[32];
+
+    sprintf(
+        isoTime, "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+        t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+        t->tm_hour, t->tm_min, t->tm_sec
+    );
+
+    // JSON組み立て（512バイトに拡張）
+    StaticJsonDocument<512> doc;
+    doc["child_id"] = 1;
+
+    // singledata
+    JsonObject singledata = doc.createNestedObject("singledata");
+    singledata["date"] = isoTime;
+    singledata["steps"] = steps;
+
+    // distances（近くにいるデバイス分だけ追加）
+    JsonArray distances = doc.createNestedArray("distances");
+    for (int i = 0; i < deviceCount; i++) {
+        if (millis() - devices[i].lastSeen > 10000) 
+            continue; // 10秒以上見えない場合はスキップ
+
+        JsonObject dist = distances.createNestedObject();
+        dist["date"] = isoTime;
+
+        // NODExx の数字部分をwith_childとして使う
+        dist["with_child"] = String(devices[i].id).substring(4).toInt();
+        dist["distance"] = devices[i].distance;
+    }
+
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    Serial.println("Sending: " + jsonStr);
+
+    HTTPClient http;
+    http.begin(API_URL);
+    http.addHeader("Content-Type", "application/json");
+
+    int httpResponseCode = http.POST(jsonStr);
+
+    if (httpResponseCode > 0) {
+        Serial.println("HTTP Response: " + String(httpResponseCode));
+        String response = http.getString();
+        Serial.println("Response: " + response);
+    } else {
+        Serial.println("Error: " + String(httpResponseCode));
+    }
+
+    http.end();
+
+    // WiFi接続後
+    configTime(9 * 3600, 0, "pool.ntp.org", "ntp.jst.mfeed.ad.jp");
+
+    // 同期完了まで待つ
+    struct tm timeinfo;
+    while (!getLocalTime(&timeinfo)) {
+        Serial.println("NTP同期待ち...");
+        delay(500);
+    }
+    Serial.println("NTP同期完了");
+}
+    
 // =========================
 // loop
 // =========================
@@ -466,27 +386,15 @@ void loop()
     const unsigned long STEP_INTERVAL = 300;
 
     if (!calibrated) {
-
         for (int i = 0; i < 40; i++) {
-
             float ax, ay, az;
 
-            M5.Imu.getAccelData(
-                &ax,
-                &ay,
-                &az
-            );
+            M5.Imu.getAccelData(&ax, &ay, &az);
 
             float accelMagnitude =
-                sqrt(
-                    ax * ax +
-                    ay * ay +
-                    az * az
-                );
+                sqrt(ax * ax + ay * ay + az * az);
 
-            gravity =
-                gravity * 0.9f +
-                accelMagnitude * 0.1f;
+            gravity = gravity * 0.9f + accelMagnitude * 0.1f;
 
             delay(20);
         }
@@ -496,98 +404,48 @@ void loop()
 
     float ax, ay, az;
 
-    M5.Imu.getAccelData(
-        &ax,
-        &ay,
-        &az
-    );
+    M5.Imu.getAccelData(&ax, &ay, &az);
 
-    float accelMagnitude =
-        sqrt(
-            ax * ax +
-            ay * ay +
-            az * az
-        );
+    float accelMagnitude = sqrt(ax * ax + ay * ay + az * az);
 
-    gravity =
-        gravity * ALPHA +
-        accelMagnitude * (1.0f - ALPHA);
+    gravity = gravity * ALPHA + accelMagnitude * (1.0f - ALPHA);
+    filtered = accelMagnitude - gravity;
 
-    filtered =
-        accelMagnitude - gravity;
+    bool currentRising = filtered > prevFiltered;
 
-    bool currentRising =
-        filtered > prevFiltered;
+    if (rising && !currentRising && prevFiltered > STEP_THRESHOLD) {
+        unsigned long now = millis();
 
-    if (
-        rising &&
-        !currentRising &&
-        prevFiltered > STEP_THRESHOLD
-    ) {
-
-        unsigned long now =
-            millis();
-
-        if (
-            now - lastStepMillis >
-            STEP_INTERVAL
-        ) {
-
+        if (now - lastStepMillis > STEP_INTERVAL) {
             stepCount++;
-
             lastStepMillis = now;
 
-            Serial.printf(
-                "STEP %d\n",
-                stepCount
-            );
+            Serial.printf("STEP %d\n", stepCount);
         }
     }
 
     rising = currentRising;
     prevFiltered = filtered;
 
-    unsigned long now =
-        millis();
+    unsigned long now = millis();
 
-    if (
-        now - lastCSVMillis >
-        CSV_INTERVAL
-    ) {
-
+    if (now - lastCSVMillis > CSV_INTERVAL) {
         float distanceSnapshot;
 
-        portENTER_CRITICAL(
-            &sharedStateMux);
+        portENTER_CRITICAL(&sharedStateMux);
 
-        distanceSnapshot =
-            distanceMeter;
+        distanceSnapshot = distanceMeter;
 
-        portEXIT_CRITICAL(
-            &sharedStateMux);
+        portEXIT_CRITICAL(&sharedStateMux);
 
-        saveDataToCSV(
-            now / 1000,
-            stepCount,
-            distanceSnapshot
-        );
-
-        sendDataToServer(
-            now / 1000,
-            stepCount,
-            distanceSnapshot
-        );
+        saveDataToCSV(now / 1000, stepCount, distanceSnapshot);
+        sendDataToServer(now / 1000, stepCount, distanceSnapshot);
 
         lastCSVMillis = now;
     }
 
-    if (
-        millis() - lastUI >
-        5000
-    ) {
-
+    if (millis() - lastUI > 5000) {
         drawUI();
-
         lastUI = millis();
     }
 
