@@ -17,8 +17,7 @@ BLEAdvertising* pAdvertising;
 TaskHandle_t bleTaskHandle;
 
 portMUX_TYPE sharedStateMux = portMUX_INITIALIZER_UNLOCKED;
-
-// =========================
+const char* API_URL = "http://10.10.1.87:8000/api/push_data";// =========================
 // 歩数
 // =========================
 volatile int stepCount = 0;
@@ -378,46 +377,72 @@ void setup()
     M5.Lcd.println(WiFi.localIP());
 }
 
-//HTTPリクエスト
-void sendDataToServer(int  time , int stepCount, float distanceSnapshot) {
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.begin(API_URL);
-    http.addHeader("Content-Type", "application/json");
+void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot) {
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi not connected!");
+            return;
+        }
 
-    // JSON 作成
-    StaticJsonDocument<200> doc;
-    doc["time"] = time;
-    doc["deviceId"]  = stepCount;
-    doc["distance"] = distanceSnapshot;
+        // ISOタイムスタンプ生成
+        time_t now = time(nullptr);
+        struct tm* t = gmtime(&now);
+        char isoTime[32];
+        sprintf(isoTime, "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+            t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+            t->tm_hour, t->tm_min, t->tm_sec);
 
-    String jsonStr;
-    serializeJson(doc, jsonStr);
+        // JSON組み立て（512バイトに拡張）
+        StaticJsonDocument<512> doc;
+        doc["child_id"] = 1;
 
-    int httpResponseCode = http.POST(jsonStr);
+        // singledata
+        JsonObject singledata = doc.createNestedObject("singledata");
+        singledata["date"] = isoTime;
+        singledata["steps"] = steps;
 
-    if (httpResponseCode > 0) {
-      String response = http.getString();
-      M5.Lcd.fillScreen(BLACK);
-      M5.Lcd.setTextColor(WHITE, BLACK);
-      M5.Lcd.setCursor(0, 0);
-      M5.Lcd.println("HTTP Response code: " + String(httpResponseCode));
-      M5.Lcd.println("Response: " + response);
+        // distances（近くにいるデバイス分だけ追加）
+        JsonArray distances = doc.createNestedArray("distances");
+        for (int i = 0; i < deviceCount; i++) {
+            if (millis() - devices[i].lastSeen > 10000) continue; // 10秒以上見えないはスキップ
+            JsonObject dist = distances.createNestedObject();
+            dist["date"] = isoTime;
+            // NODExx の数字部分をwith_childとして使う
+            dist["with_child"] = String(devices[i].id).substring(4).toInt();
+            dist["distance"] = devices[i].distance;
+        }
 
-      if (httpResponseCode == 200) {
-        M5.Lcd.println("Register Confirmed");
-        delay(1000);
-      }
- 
-    } else {
-      M5.Lcd.println("Error on sending POST: " + String(httpResponseCode));
+        String jsonStr;
+        serializeJson(doc, jsonStr);
+        Serial.println("Sending: " + jsonStr);
+
+        HTTPClient http;
+        http.begin(API_URL);
+        http.addHeader("Content-Type", "application/json");
+
+        int httpResponseCode = http.POST(jsonStr);
+
+        if (httpResponseCode > 0) {
+            Serial.println("HTTP Response: " + String(httpResponseCode));
+            String response = http.getString();
+            Serial.println("Response: " + response);
+        } else {
+            Serial.println("Error: " + String(httpResponseCode));
+        }
+
+        http.end();
+
+                // WiFi接続後
+        configTime(9 * 3600, 0, "pool.ntp.org", "ntp.jst.mfeed.ad.jp");
+
+        // 同期完了まで待つ
+        struct tm timeinfo;
+        while (!getLocalTime(&timeinfo)) {
+            Serial.println("NTP同期待ち...");
+            delay(500);
+        }
+        Serial.println("NTP同期完了");
     }
-
-    http.end();
-  } else {
-    M5.Lcd.println("WiFi not connected!");
-  }
-}
+    
 
 // =========================
 // loop
