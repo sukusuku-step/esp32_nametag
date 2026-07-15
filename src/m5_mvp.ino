@@ -245,6 +245,15 @@ void bleTask(void *arg) {
 }
 
 // =========================
+// child_idの取得
+// =========================
+int getChildId(const String& deviceName) {
+    // DBから児童の名前に対応したidを照合する
+
+    return 1;
+}
+
+// =========================
 // UI描画
 // =========================
 void drawUI() {
@@ -353,6 +362,7 @@ void setup() {
 // Wi-Fi経由のデータ送信
 // =========================
 void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot) {
+    // Wi-Fiのコネクションを確認
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi not connected!");
         return;
@@ -371,33 +381,38 @@ void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot
 
     // JSON組み立て（512バイトに拡張）
     StaticJsonDocument<512> doc;
-    doc["child_id"] = 1;
 
-    // singledata
+    // 自分の児童IDをDBから参照して設定
+    doc["child_id"] = getChildId(DEVICE_ID);
+
+    // 歩数情報を格納
     JsonObject singledata = doc.createNestedObject("singledata");
-    singledata["date"] = isoTime;
-    singledata["steps"] = steps;
+    singledata["date"] = isoTime; // タイムスタンプ
+    singledata["steps"] = steps; // 歩数情報
 
-    // distances（近くにいるデバイス分だけ追加）
+    // 相対距離情報を格納（近くにいるデバイス分だけ追加）
     JsonArray distances = doc.createNestedArray("distances");
     for (int i = 0; i < deviceCount; i++) {
+        // 10秒以上検出されていないデバイスは送信しない
         if (millis() - devices[i].lastSeen > 10000) 
-            continue; // 10秒以上見えない場合はスキップ
+            continue;
 
         JsonObject dist = distances.createNestedObject();
-        dist["date"] = isoTime;
 
-        // NODExx の数字部分をwith_childとして使う
-        dist["with_child"] = String(devices[i].id).substring(4).toInt();
-        dist["distance"] = devices[i].distance;
+        dist["date"] = isoTime; // タイムスタンプ
+        // dist["with_child"] = getChildId(devices[i].id); // 測定した相手のID
+        dist["with_child"] = 2; // テスト用に定数でID=2を設定
+        dist["distance"] = devices[i].distance; // 相対距離情報
     }
 
+    // JSONを文字列へ変換
     String jsonStr;
     serializeJson(doc, jsonStr);
     Serial.println("Sending: " + jsonStr);
 
+    // HTTPのPOSTでサーバへデータを送信するようにする
     HTTPClient http;
-    http.begin(API_URL);
+    http.begin(API_URL); // APIサーバのURLを設定
     http.addHeader("Content-Type", "application/json");
 
     int httpResponseCode = http.POST(jsonStr);
@@ -411,15 +426,6 @@ void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot
     }
 
     http.end();
-}
-
-// =========================
-// child_idの取得
-// =========================
-int getChildId(char* device_name) {
-    // DBから児童の名前に対応したidを照合する
-
-    return 1;
 }
     
 // =========================
