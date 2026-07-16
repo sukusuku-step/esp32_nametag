@@ -344,18 +344,6 @@ void setup() {
     M5.Lcd.print("IP address = ");
     M5.Lcd.println(WiFi.localIP()); // デバイスのローカルIPアドレス
 
-    // Wi-Fi接続後
-    configTime(9 * 3600, 0, "pool.ntp.org", "ntp.jst.mfeed.ad.jp");
-
-    struct tm timeinfo;
-
-    // 同期完了まで待つ
-    while (!getLocalTime(&timeinfo)) {
-        Serial.println("NTP同期待ち...");
-        delay(500);
-    }
-
-    Serial.println("NTP同期完了");
 }
 
 // =========================
