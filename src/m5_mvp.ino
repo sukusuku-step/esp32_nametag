@@ -18,6 +18,8 @@ TaskHandle_t bleTaskHandle;
 
 portMUX_TYPE sharedStateMux = portMUX_INITIALIZER_UNLOCKED;
 
+unsigned long lastUI = 0; // 画面更新頻度のパラメータ
+
 // =========================
 // 歩数
 // =========================
@@ -422,7 +424,6 @@ void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot
 void loop() {
     updateStepCount(); // 歩数計算
 
-    unsigned long lastUI = 0;
     unsigned long now = millis();
 
     if (now - lastCSVMillis > CSV_INTERVAL) {
@@ -440,9 +441,9 @@ void loop() {
         lastCSVMillis = now;
     }
 
-    if (millis() - lastUI > 5000) {
+    if (now - lastUI > 1000) {
         drawUI();
-        lastUI = millis();
+        lastUI = now;
     }
 
     delay(30);
