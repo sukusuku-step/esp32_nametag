@@ -292,7 +292,7 @@ void sendTask(void *arg)
 
             portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
-            sendDataToServer(sendData.timestamp, sendData.steps, sendData.distance);
+            sendDataToServer(data.timestamp, data.steps, data.distance);
         }
 
         vTaskDelay(100 / portTICK_PERIOD_MS);
