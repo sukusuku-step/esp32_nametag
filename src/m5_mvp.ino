@@ -309,22 +309,59 @@ int getChildId(const String& deviceName) {
 }
 
 // =========================
-// UI描画
+// UI初期描画
 // =========================
-void drawUI() {
+void drawUIBase() {
     M5.Display.fillScreen(TFT_NAVY);
     M5.Display.setTextColor(WHITE);
+
+    // デバイス名
     M5.Display.setTextSize(5);
     M5.Display.setCursor(20, 20);
     M5.Display.println(DEVICE_ID);
+
+    // STEPのラベル
     M5.Display.setTextSize(3);
     M5.Display.setCursor(20, 90);
+    M5.Display.printf("STEP:");
 
-    M5.Display.printf("STEP: %d", stepCount);
+    // Batteryのラベル
+    M5.Display.setTextColor(TFT_YELLOW);
+    M5.Display.setCursor(M5.Display.width() - 110, M5.Display.height() - 30);
+    M5.Display.printf("BAT:");
+}
+
+// =========================
+// STEP部分のUI更新
+// =========================
+void updateStepUI() {
+    static int oldStep = -1;
+
+    if (oldStep == stepCount)
+        return;
+
+    oldStep = stepCount;
+
+    // 数字だけ消す
+    M5.Display.fillRect(120, 90, 120, 30, TFT_NAVY);
+
+    M5.Display.setTextColor(WHITE);
+    M5.Display.setTextSize(3);
+    M5.Display.setCursor(120, 90);
+    M5.Display.printf("%d", stepCount);
+}
+
+// =========================
+// 相対距離の表示のUI更新
+// =========================
+void updateDistanceUI() {
+    // 距離一覧だけ消す
+    M5.Display.fillRect(20, 140, 300, 150, TFT_NAVY);
+
+    M5.Display.setTextColor(WHITE);
+    M5.Display.setTextSize(2);
 
     int y = 140;
-
-    M5.Display.setTextSize(2);
 
     portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
@@ -338,14 +375,37 @@ void drawUI() {
         y += 25;
     }
 
-    portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+    portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避    
+}
+
+// =========================
+// Battery部分のUI更新
+// =========================
+void updateBatteryUI() {
+    static int oldBattery = -1;
 
     int battery = M5.Power.getBatteryLevel();
 
+    if (battery == oldBattery)
+        return;
+
+    oldBattery = battery;
+
+    M5.Display.fillRect(M5.Display.width() - 60, M5.Display.height() - 30, 60, 25, TFT_NAVY);
+
     M5.Display.setTextColor(TFT_YELLOW);
-    M5.Display.setCursor(M5.Display.width() - 110, M5.Display.height() - 30);
+    M5.Display.setCursor(M5.Display.width() - 60, M5.Display.height() - 30);
 
     M5.Display.printf("%d%%", battery);
+}
+
+// =========================
+// UI描画（部分の更新のみ）
+// =========================
+void drawUI() {
+    updateStepUI();
+    updateDistanceUI();
+    updateBatteryUI();
 }
 
 // =========================
@@ -368,10 +428,8 @@ void setup() {
     initSDCard();
     createNewCSVFile();
 
-    // BLE
     BLEDevice::init(DEVICE_ID);
 
-    // Advertising
     pAdvertising = BLEDevice::getAdvertising();
 
     BLEAdvertisementData advData;
@@ -404,6 +462,7 @@ void setup() {
     M5.Lcd.print("IP address = ");
     M5.Lcd.println(WiFi.localIP()); // デバイスのローカルIPアドレス
 
+    drawUIBase(); // UIの初期描画
 }
 
 // =========================
@@ -512,7 +571,7 @@ void loop() {
     }
 
     if (now - lastUI > 1000) {
-        drawUI();
+        drawUI(); // 必要な部分だけ数値の表示を更新する
         lastUI = now;
     }
 
