@@ -12,9 +12,31 @@
 
 #define DEVICE_ID "YUUKI" // 児童の名前（デバイスごとに変える）
 
+// ======================================================
+// マルチスレッドの構成
+//
+// Core1（歩数と相対距離の取得）
+//   ・loop()
+//       - 歩数計算
+//       - SDカード保存
+//       - 画面描画
+//       - 送信データ作成
+//
+//   ・BLE Task
+//       - BLEスキャン
+//       - devices[] 更新
+//
+// Core0（サーバとのデータ通信）
+//   ・Send Task
+//       - sendFlagを監視
+//       - HTTP通信
+//
+// ======================================================
+
 BLEScan* pBLEScan;
 BLEAdvertising* pAdvertising;
 TaskHandle_t bleTaskHandle;
+TaskHandle_t sendTaskHandle;
 
 portMUX_TYPE sharedStateMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -30,6 +52,15 @@ volatile int stepCount = 0;
 // =========================
 volatile int latestRSSI = -100;
 volatile float distanceMeter = -1;
+
+struct SendData {
+    unsigned long timestamp;
+    int steps;
+    float distance;
+};
+
+volatile bool sendFlag = false;
+SendData sendData;
 
 // =========================
 // 複数ノード管理
@@ -221,21 +252,21 @@ class MyCallbacks : public BLEAdvertisedDeviceCallbacks {
         int rssi = device.getRSSI();
         float distance = calculateDistance(rssi);
 
-        updateDevice(name, rssi);
+        portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
-        portENTER_CRITICAL(&sharedStateMux);
+        updateDevice(name, rssi);
 
         latestRSSI = rssi;
         distanceMeter = distance;
 
-        portEXIT_CRITICAL(&sharedStateMux);
+        portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
         Serial.printf("%s RSSI=%d Dist=%.2f\n", name.c_str(), rssi, distance);
     }
 };
 
 // =========================
-// BLE task
+// BLE通信用スレッド
 // =========================
 void bleTask(void *arg) {
     while (true) {
@@ -243,6 +274,28 @@ void bleTask(void *arg) {
         pBLEScan->clearResults();
 
         vTaskDelay(200 / portTICK_PERIOD_MS);
+    }
+}
+
+// =========================
+// サーバとの通信用スレッド
+// =========================
+void sendTask(void *arg)
+{
+    while (true) {
+        if (sendFlag) {
+            portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+
+            // ローカル変数へコピーしてから送信する
+            SendData data = sendData;
+            sendFlag = false;
+
+            portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+
+            sendDataToServer(sendData.timestamp, sendData.steps, sendData.distance);
+        }
+
+        vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 }
 
@@ -273,6 +326,8 @@ void drawUI() {
 
     M5.Display.setTextSize(2);
 
+    portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+
     for (int i = 0; i < deviceCount; i++) {
         if (millis() - devices[i].lastSeen > 10000)
             continue;
@@ -282,6 +337,8 @@ void drawUI() {
 
         y += 25;
     }
+
+    portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
     int battery = M5.Power.getBatteryLevel();
 
@@ -334,6 +391,7 @@ void setup() {
     pBLEScan->setWindow(80);
 
     xTaskCreatePinnedToCore(bleTask, "BLE", 4096, NULL, 2, &bleTaskHandle, 1);
+    xTaskCreatePinnedToCore(sendTask, "SEND", 8192, NULL, 1, &sendTaskHandle, 0);
 
     // Wi-Fiへの接続を行う
     WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -380,6 +438,8 @@ void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot
     singledata["date"] = isoTime; // タイムスタンプ
     singledata["steps"] = steps; // 歩数情報
 
+    portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+
     // 相対距離情報を格納（近くにいるデバイス分だけ追加）
     JsonArray distances = doc.createNestedArray("distances");
     for (int i = 0; i < deviceCount; i++) {
@@ -394,6 +454,8 @@ void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot
         dist["with_child"] = 2; // テスト用に定数でID=2を設定
         dist["distance"] = devices[i].distance; // 相対距離情報
     }
+
+    portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
     // JSONを文字列へ変換
     String jsonStr;
@@ -436,7 +498,15 @@ void loop() {
         portEXIT_CRITICAL(&sharedStateMux);
 
         saveDataToCSV(now / 1000, stepCount, distanceSnapshot);
-        sendDataToServer(now / 1000, stepCount, distanceSnapshot);
+
+        portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+
+        sendData.timestamp = now / 1000;
+        sendData.steps = stepCount;
+        sendData.distance = distanceSnapshot;
+        sendFlag = true;
+
+        portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
         lastCSVMillis = now;
     }
