@@ -10,7 +10,7 @@
 #include <time.h>
 #include "cert.h"
 
-#define DEVICE_ID "YUUKI" // 児童の名前（デバイスごとに変える）
+#define DEVICE_ID "NODE_YUUKI" // 児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
 
 // ======================================================
 // マルチスレッドの構成
@@ -114,10 +114,7 @@ void createNewCSVFile() {
         file.println("Timestamp,Steps,Distance(m)");
         file.close();
 
-        Serial.printf(
-            "New CSV file created: %s\n",
-            csvFileName
-        );
+        Serial.printf("New CSV file created: %s\n",csvFileName);
     }
 }
 
@@ -157,8 +154,7 @@ void updateStepCount() {
 
             M5.Imu.getAccelData(&ax, &ay, &az);
 
-            float accelMagnitude =
-                sqrt(ax * ax + ay * ay + az * az);
+            float accelMagnitude = sqrt(ax * ax + ay * ay + az * az);
 
             gravity = gravity * 0.9f + accelMagnitude * 0.1f;
 
@@ -220,7 +216,6 @@ void updateDevice(String id, int rssi) {
 
     for (int i = 0; i < deviceCount; i++) {
         if (devices[i].id == id) {
-
             devices[i].rssi = rssi;
             devices[i].distance = distance;
             devices[i].lastSeen = millis();
@@ -318,17 +313,12 @@ void drawUIBase() {
     // デバイス名
     M5.Display.setTextSize(5);
     M5.Display.setCursor(20, 20);
-    M5.Display.println(DEVICE_ID);
+    M5.Display.println(String(DEVICE_ID).substring(5)); // NODE_の部分は削って表示させる
 
     // STEPのラベル
     M5.Display.setTextSize(3);
     M5.Display.setCursor(20, 90);
     M5.Display.printf("STEP:");
-
-    // Batteryのラベル
-    M5.Display.setTextColor(TFT_YELLOW);
-    M5.Display.setCursor(M5.Display.width() - 110, M5.Display.height() - 30);
-    M5.Display.printf("BAT:");
 }
 
 // =========================
@@ -337,10 +327,11 @@ void drawUIBase() {
 void updateStepUI() {
     static int oldStep = -1;
 
+    // 表示する値が変わっていない場合は更新する必要がない
     if (oldStep == stepCount)
         return;
 
-    oldStep = stepCount;
+    oldStep = stepCount; // 以前の値を覚えておく
 
     // 数字だけ消す
     M5.Display.fillRect(120, 90, 120, 30, TFT_NAVY);
@@ -355,13 +346,17 @@ void updateStepUI() {
 // 相対距離の表示のUI更新
 // =========================
 void updateDistanceUI() {
-    // 距離一覧だけ消す
-    M5.Display.fillRect(20, 140, 300, 150, TFT_NAVY);
+    const int listX = 20;
+    const int listY = 140;
+    const int listW = 300;
+    const int listH = 60;
+    
+    M5.Display.fillRect(listX, listY, listW, listH, TFT_NAVY);
 
     M5.Display.setTextColor(WHITE);
     M5.Display.setTextSize(2);
 
-    int y = 140;
+    int y = listY;
 
     portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
@@ -369,8 +364,14 @@ void updateDistanceUI() {
         if (millis() - devices[i].lastSeen > 10000)
             continue;
 
-        M5.Display.setCursor(20, y);
-        M5.Display.printf("%s %.1fm", devices[i].id.c_str(), devices[i].distance);
+        // BATエリアに文字が被らないようにする
+        if (y + 25 > listY + listH)
+            break;
+
+        M5.Display.setCursor(listX, y);
+
+        // NODE_の部分は削って相対距離の相手の名前は表示させる
+        M5.Display.printf("%s %.1fm", devices[i].id.substring(5).c_str(), devices[i].distance);
 
         y += 25;
     }
@@ -386,17 +387,27 @@ void updateBatteryUI() {
 
     int battery = M5.Power.getBatteryLevel();
 
+    // 取得失敗（-1などの無効値）は無視して、前回表示を維持する
+    if (battery < 0)
+        return;
+    
+    // 表示する値が変わっていない場合は更新する必要がない
     if (battery == oldBattery)
         return;
 
-    oldBattery = battery;
+    oldBattery = battery; // 以前の値を覚えておく
 
-    M5.Display.fillRect(M5.Display.width() - 60, M5.Display.height() - 30, 60, 25, TFT_NAVY);
+    const int x = M5.Display.width() - 160;
+    const int y = M5.Display.height() - 30;
+    const int w = 160;
+    const int h = 30;
+
+    M5.Display.fillRect(x, y, w, h, TFT_NAVY);
 
     M5.Display.setTextColor(TFT_YELLOW);
-    M5.Display.setCursor(M5.Display.width() - 60, M5.Display.height() - 30);
-
-    M5.Display.printf("%d%%", battery);
+    M5.Display.setTextSize(3);
+    M5.Display.setCursor(x, y);
+    M5.Display.printf("BAT:%d%%", battery);
 }
 
 // =========================
@@ -475,6 +486,7 @@ void setup() {
     }
 
     drawUIBase(); // UIの初期描画
+    updateBatteryUI(); // 初回のバッテリー残量を表示
 }
 
 // =========================
@@ -550,7 +562,7 @@ void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot
 
     http.end();
 }
-    
+
 // =========================
 // メインループ
 // =========================
