@@ -453,14 +453,26 @@ void setup() {
 
     // Wi-Fiへの接続を行う
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    while( WiFi.status() != WL_CONNECTED) {
-        delay(500); 
-        M5.Lcd.print("."); 
+
+    int dotCount = 0;
+    const int WIFI_CONNECT_DOT_INTERVAL_MS = 500; // ドット表示間隔 [ms]
+    const int WIFI_CONNECT_TIMEOUT_DOTS = 20; // タイムアウトまでのドット数
+
+    while (WiFi.status() != WL_CONNECTED && dotCount < WIFI_CONNECT_TIMEOUT_DOTS) {
+        delay(WIFI_CONNECT_DOT_INTERVAL_MS); // Wi-Fi接続試行中にはドットを表示していく
+        M5.Lcd.print(".");
+        dotCount++;
     }
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.println("WiFi connected");
-    M5.Lcd.print("IP address = ");
-    M5.Lcd.println(WiFi.localIP()); // デバイスのローカルIPアドレス
+
+    if (WiFi.status() == WL_CONNECTED) { 
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.println("WiFi connected"); // Wi-Fi接続完了
+        M5.Lcd.print("IP address = ");
+        M5.Lcd.println(WiFi.localIP()); // デバイスのローカルIPアドレスを表示
+    } else {
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.println("WiFi Timeout"); // Wi-Fi接続タイムアウト
+    }
 
     drawUIBase(); // UIの初期描画
 }
