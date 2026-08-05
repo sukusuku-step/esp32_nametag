@@ -10,7 +10,7 @@
 #include <time.h>
 #include "cert.h"
 
-#define DEVICE_ID "NODE_YUUKI" // 児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
+#define DEVICE_ID "NODE_ANNA" // 児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
 
 // ======================================================
 // マルチスレッドの構成
@@ -307,8 +307,9 @@ int getChildId(const String& deviceName) {
 // UI初期描画
 // =========================
 void drawUIBase() {
-    M5.Display.fillScreen(TFT_NAVY);
+    M5.Display.fillScreen(BLACK);
     M5.Display.setTextColor(WHITE);
+    M5.Display.setBrightness(40); //画面明るさ
 
     // デバイス名
     M5.Display.setTextSize(5);
@@ -334,7 +335,7 @@ void updateStepUI() {
     oldStep = stepCount; // 以前の値を覚えておく
 
     // 数字だけ消す
-    M5.Display.fillRect(120, 90, 120, 30, TFT_NAVY);
+    M5.Display.fillRect(120, 90, 120, 30, BLACK);
 
     M5.Display.setTextColor(WHITE);
     M5.Display.setTextSize(3);
@@ -351,7 +352,7 @@ void updateDistanceUI() {
     const int listW = 300;
     const int listH = 60;
     
-    M5.Display.fillRect(listX, listY, listW, listH, TFT_NAVY);
+    M5.Display.fillRect(listX, listY, listW, listH, ILI9341_BLACK);
 
     M5.Display.setTextColor(WHITE);
     M5.Display.setTextSize(2);
@@ -402,7 +403,7 @@ void updateBatteryUI() {
     const int w = 160;
     const int h = 30;
 
-    M5.Display.fillRect(x, y, w, h, TFT_NAVY);
+    M5.Display.fillRect(x, y, w, h, BLACK);
 
     M5.Display.setTextColor(TFT_YELLOW);
     M5.Display.setTextSize(3);
@@ -594,7 +595,7 @@ void loop() {
         lastCSVMillis = now;
     }
 
-    if (now - lastUI > 1000) {
+    if (now - lastUI > 10000) { //10秒ごとの更新
         drawUI(); // 必要な部分だけ数値の表示を更新する
         lastUI = now;
     }
