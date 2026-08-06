@@ -94,6 +94,21 @@ void initSDCard() {
     Serial.println("SD card initialized");
 }
 
+// =========================
+// NTPによる時刻同期
+// =========================
+void syncTimeWithNTP() {
+    configTime(9 * 3600, 0, "ntp.nict.jp", "time.google.com"); // JST（UTC+9）で同期
+
+    struct tm timeinfo;
+
+    if (getLocalTime(&timeinfo, 5000)) { // 最大5秒待つ
+        Serial.println("NTP time synced");
+    } else {
+        Serial.println("NTP time sync failed");
+    }
+}
+
 void createNewCSVFile() {
     time_t now = time(nullptr);
     struct tm* timeinfo = localtime(&now);
@@ -462,7 +477,6 @@ void setup() {
     M5.Display.setRotation(1);
 
     initSDCard();
-    createNewCSVFile();
 
     BLEDevice::init(DEVICE_ID);
 
@@ -500,15 +514,19 @@ void setup() {
         dotCount++;
     }
 
-    if (WiFi.status() == WL_CONNECTED) { 
+    if (WiFi.status() == WL_CONNECTED) {
         M5.Lcd.fillScreen(BLACK);
         M5.Lcd.println("WiFi connected"); // Wi-Fi接続完了
         M5.Lcd.print("IP address = ");
         M5.Lcd.println(WiFi.localIP()); // デバイスのローカルIPアドレスを表示
+
+        syncTimeWithNTP(); // Wi-Fi接続時のみ時刻同期
     } else {
         M5.Lcd.fillScreen(BLACK);
         M5.Lcd.println("WiFi Timeout"); // Wi-Fi接続タイムアウト
     }
+
+    createNewCSVFile(); // 同期できていればその時刻でファイル名を生成する
 
     drawUIBase(); // UIの初期描画
     updateBatteryUI(); // 初回のバッテリー残量を表示
