@@ -10,7 +10,7 @@
 #include <time.h>
 #include "cert.h"
 
-#define DEVICE_ID "NODE_ANNA" // 児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
+#define DEVICE_ID "NODE_B" // 児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
 
 // ======================================================
 // マルチスレッドの構成
@@ -111,7 +111,7 @@ void createNewCSVFile() {
     File file = SD.open(csvFileName, FILE_WRITE);
 
     if (file) {
-        file.println("Timestamp,Steps,Distance(m)");
+        file.println("Timestamp,Steps,NodeID,Distance(m)");
         file.close();
 
         Serial.printf("New CSV file created: %s\n",csvFileName);
@@ -120,17 +120,41 @@ void createNewCSVFile() {
 
 // =========================
 // CSVへのデータの書き込み
+// 近接する全ノードの名前と距離をそれぞれ1行ずつ書き込む
 // =========================
-void saveDataToCSV(unsigned long timestamp, int steps, float distance) {
+void saveDataToCSV(unsigned long timestamp, int steps) {
     if (csvFileName[0] == '\0')
         return;
 
+    DeviceInfo nearbyDevices[20];
+    int nearbyCount = 0;
+
+    portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+
+    for (int i = 0; i < deviceCount; i++) {
+        if (millis() - devices[i].lastSeen > 10000) // 10秒以上検出されていないデバイスは対象外
+            continue;
+
+        nearbyDevices[nearbyCount] = devices[i];
+        nearbyCount++;
+    }
+
+    portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+
     File file = SD.open(csvFileName, FILE_APPEND);
 
-    if (file) {
-        file.printf("%lu,%d,%.2f\n", timestamp, steps, distance);
-        file.close();
+    if (!file)
+        return;
+
+    if (nearbyCount == 0) {
+        file.printf("%lu,%d,,\n", timestamp, steps); // 近接ノードがいない場合も歩数だけは記録する
+    } else {
+        for (int i = 0; i < nearbyCount; i++) {
+            file.printf("%lu,%d,%s,%.2f\n", timestamp, steps, nearbyDevices[i].id.c_str(), nearbyDevices[i].distance);
+        }
     }
+
+    file.close();
 }
 
 // =========================
@@ -573,21 +597,13 @@ void loop() {
     unsigned long now = millis();
 
     if (now - lastCSVMillis > CSV_INTERVAL) {
-        float distanceSnapshot;
-
-        portENTER_CRITICAL(&sharedStateMux);
-
-        distanceSnapshot = distanceMeter;
-
-        portEXIT_CRITICAL(&sharedStateMux);
-
-        saveDataToCSV(now / 1000, stepCount, distanceSnapshot);
+        saveDataToCSV(now / 1000, stepCount);
 
         portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
         sendData.timestamp = now / 1000;
         sendData.steps = stepCount;
-        sendData.distance = distanceSnapshot;
+        sendData.distance = distanceMeter;
         sendFlag = true;
 
         portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
