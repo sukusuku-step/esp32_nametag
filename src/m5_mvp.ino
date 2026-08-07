@@ -115,6 +115,18 @@ void syncTimeWithNTP() {
     }
 }
 
+// =========================
+// ISO8601形式（UTC）の現在時刻を取得
+// =========================
+void getIsoTimeUTC(char* buffer, size_t size) {
+    time_t now = time(nullptr);
+    struct tm* t = gmtime(&now);
+
+    snprintf(buffer, size, "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+             t->tm_hour, t->tm_min, t->tm_sec);
+}
+
 void createNewCSVFile() {
     time_t now = time(nullptr);
     struct tm* timeinfo = localtime(&now);
@@ -143,9 +155,12 @@ void createNewCSVFile() {
 // CSVへのデータの書き込み
 // 近接する全ノードの名前と距離をそれぞれ1行ずつ書き込む
 // =========================
-void saveDataToCSV(unsigned long timestamp, int steps, float ax, float ay, float az, float gx, float gy, float gz) {
+void saveDataToCSV(int steps, float ax, float ay, float az, float gx, float gy, float gz) {
     if (csvFileName[0] == '\0')
         return;
+
+    char isoTime[32];
+    getIsoTimeUTC(isoTime, sizeof(isoTime));
 
     DeviceInfo nearbyDevices[20];
     int nearbyCount = 0;
@@ -169,11 +184,11 @@ void saveDataToCSV(unsigned long timestamp, int steps, float ax, float ay, float
 
     if (nearbyCount == 0) {
         // 近接ノードがいない場合も歩数・6軸データだけは記録する
-        file.printf("%lu,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,,\n", timestamp, steps, ax, ay, az, gx, gy, gz);
+        file.printf("%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,,\n", isoTime, steps, ax, ay, az, gx, gy, gz);
     } else {
         for (int i = 0; i < nearbyCount; i++) {
-            file.printf("%lu,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%.2f\n",
-                         timestamp, steps, ax, ay, az, gx, gy, gz,
+            file.printf("%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%.2f\n",
+                         isoTime, steps, ax, ay, az, gx, gy, gz,
                          nearbyDevices[i].id.c_str(), nearbyDevices[i].distance);
         }
     }
@@ -561,15 +576,8 @@ void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot
     }
 
     // ISOタイムスタンプ生成
-    time_t now = time(nullptr);
-    struct tm* t = gmtime(&now);
     char isoTime[32];
-
-    sprintf(
-        isoTime, "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
-        t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-        t->tm_hour, t->tm_min, t->tm_sec
-    );
+    getIsoTimeUTC(isoTime, sizeof(isoTime));
 
     // JSON組み立て（512バイトに拡張）
     StaticJsonDocument<512> doc;
@@ -633,7 +641,7 @@ void loop() {
     unsigned long now = millis();
 
     if (now - lastCSVMillis > CSV_INTERVAL) {
-        saveDataToCSV(now / 1000, stepCount, latestAx, latestAy, latestAz, latestGx, latestGy, latestGz);
+        saveDataToCSV(stepCount, latestAx, latestAy, latestAz, latestGx, latestGy, latestGz);
 
         portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
