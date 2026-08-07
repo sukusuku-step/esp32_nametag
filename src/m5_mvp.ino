@@ -86,7 +86,16 @@ int deviceCount = 0;
 // =========================
 char csvFileName[32] = "";
 unsigned long lastCSVMillis = 0;
-const unsigned long CSV_INTERVAL = 10000;
+unsigned long lastFlushMillis = 0;
+unsigned long lastSendMillis = 0;
+const unsigned long CSV_INTERVAL = 100;         // データ取得・バッファ追加間隔 [ms]
+const unsigned long CSV_FLUSH_INTERVAL = 1000;  // バッファをSDへ書き込む間隔 [ms]
+const unsigned long SEND_INTERVAL = 10000;      // サーバへの送信間隔 [ms]
+
+// SDへの書き込み回数を減らすためのバッファ（固定サイズ、ヒープ確保なし）
+#define CSV_BUFFER_SIZE 8192
+char csvBuffer[CSV_BUFFER_SIZE];
+size_t csvBufferLen = 0;
 
 // =========================
 // SDカードの初期化
@@ -152,8 +161,40 @@ void createNewCSVFile() {
 }
 
 // =========================
-// CSVへのデータの書き込み
-// 近接する全ノードの名前と距離をそれぞれ1行ずつ書き込む
+// CSVバッファへ1行追記する（バッファが満杯なら先にフラッシュする）
+// =========================
+void appendToCSVBuffer(const char* line) {
+    size_t lineLen = strlen(line);
+
+    if (csvBufferLen + lineLen >= CSV_BUFFER_SIZE)
+        flushCSVBuffer();
+
+    memcpy(csvBuffer + csvBufferLen, line, lineLen);
+    csvBufferLen += lineLen;
+}
+
+// =========================
+// CSVバッファをSDへまとめて書き込む
+// 毎回ファイルをopen/closeする代わりに、一定間隔でまとめて書き込むことで
+// SDカードへのアクセス頻度を抑える
+// =========================
+void flushCSVBuffer() {
+    if (csvFileName[0] == '\0' || csvBufferLen == 0)
+        return;
+
+    File file = SD.open(csvFileName, FILE_APPEND);
+
+    if (file) {
+        file.write((const uint8_t*)csvBuffer, csvBufferLen);
+        file.close();
+    }
+
+    csvBufferLen = 0;
+}
+
+// =========================
+// データをCSVバッファへ書き込む
+// 近接する全ノードの名前と距離をそれぞれ1行ずつ追記する
 // =========================
 void saveDataToCSV(int steps, float ax, float ay, float az, float gx, float gy, float gz) {
     if (csvFileName[0] == '\0')
@@ -177,23 +218,20 @@ void saveDataToCSV(int steps, float ax, float ay, float az, float gx, float gy, 
 
     portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
-    File file = SD.open(csvFileName, FILE_APPEND);
-
-    if (!file)
-        return;
+    char line[160];
 
     if (nearbyCount == 0) {
         // 近接ノードがいない場合も歩数・6軸データだけは記録する
-        file.printf("%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,,\n", isoTime, steps, ax, ay, az, gx, gy, gz);
+        snprintf(line, sizeof(line), "%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,,\n", isoTime, steps, ax, ay, az, gx, gy, gz);
+        appendToCSVBuffer(line);
     } else {
         for (int i = 0; i < nearbyCount; i++) {
-            file.printf("%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%.2f\n",
-                         isoTime, steps, ax, ay, az, gx, gy, gz,
-                         nearbyDevices[i].id.c_str(), nearbyDevices[i].distance);
+            snprintf(line, sizeof(line), "%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%.2f\n",
+                     isoTime, steps, ax, ay, az, gx, gy, gz,
+                     nearbyDevices[i].id.c_str(), nearbyDevices[i].distance);
+            appendToCSVBuffer(line);
         }
     }
-
-    file.close();
 }
 
 // =========================
@@ -640,9 +678,17 @@ void loop() {
 
     unsigned long now = millis();
 
-    if (now - lastCSVMillis > CSV_INTERVAL) {
+    if (now - lastCSVMillis > CSV_INTERVAL) { // 0.1秒ごとにバッファへ取得・追記
         saveDataToCSV(stepCount, latestAx, latestAy, latestAz, latestGx, latestGy, latestGz);
+        lastCSVMillis = now;
+    }
 
+    if (now - lastFlushMillis > CSV_FLUSH_INTERVAL) { // 1秒ごとにまとめてSDへ書き込む
+        flushCSVBuffer();
+        lastFlushMillis = now;
+    }
+
+    if (now - lastSendMillis > SEND_INTERVAL) { // 10秒ごとにサーバへ送信
         portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
         sendData.timestamp = now / 1000;
@@ -652,7 +698,7 @@ void loop() {
 
         portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
-        lastCSVMillis = now;
+        lastSendMillis = now;
     }
 
     if (now - lastUI > 10000) { //10秒ごとの更新
