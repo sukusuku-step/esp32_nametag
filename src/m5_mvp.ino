@@ -48,6 +48,12 @@ unsigned long lastUI = 0; // 画面更新頻度のパラメータ
 volatile int stepCount = 0;
 
 // =========================
+// IMU（6軸: 加速度・ジャイロ）
+// =========================
+volatile float latestAx = 0, latestAy = 0, latestAz = 0;
+volatile float latestGx = 0, latestGy = 0, latestGz = 0;
+
+// =========================
 // BLE（相対距離）
 // =========================
 volatile int latestRSSI = -100;
@@ -126,7 +132,7 @@ void createNewCSVFile() {
     File file = SD.open(csvFileName, FILE_WRITE);
 
     if (file) {
-        file.println("Timestamp,Steps,NodeID,Distance(m)");
+        file.println("Timestamp,Steps,Ax,Ay,Az,Gx,Gy,Gz,NodeID,Distance(m)");
         file.close();
 
         Serial.printf("New CSV file created: %s\n",csvFileName);
@@ -137,7 +143,7 @@ void createNewCSVFile() {
 // CSVへのデータの書き込み
 // 近接する全ノードの名前と距離をそれぞれ1行ずつ書き込む
 // =========================
-void saveDataToCSV(unsigned long timestamp, int steps) {
+void saveDataToCSV(unsigned long timestamp, int steps, float ax, float ay, float az, float gx, float gy, float gz) {
     if (csvFileName[0] == '\0')
         return;
 
@@ -162,10 +168,13 @@ void saveDataToCSV(unsigned long timestamp, int steps) {
         return;
 
     if (nearbyCount == 0) {
-        file.printf("%lu,%d,,\n", timestamp, steps); // 近接ノードがいない場合も歩数だけは記録する
+        // 近接ノードがいない場合も歩数・6軸データだけは記録する
+        file.printf("%lu,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,,\n", timestamp, steps, ax, ay, az, gx, gy, gz);
     } else {
         for (int i = 0; i < nearbyCount; i++) {
-            file.printf("%lu,%d,%s,%.2f\n", timestamp, steps, nearbyDevices[i].id.c_str(), nearbyDevices[i].distance);
+            file.printf("%lu,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%.2f\n",
+                         timestamp, steps, ax, ay, az, gx, gy, gz,
+                         nearbyDevices[i].id.c_str(), nearbyDevices[i].distance);
         }
     }
 
@@ -204,8 +213,17 @@ void updateStepCount() {
     }
 
     float ax, ay, az;
+    float gx, gy, gz;
 
     M5.Imu.getAccelData(&ax, &ay, &az);
+    M5.Imu.getGyroData(&gx, &gy, &gz);
+
+    latestAx = ax;
+    latestAy = ay;
+    latestAz = az;
+    latestGx = gx;
+    latestGy = gy;
+    latestGz = gz;
 
     float accelMagnitude = sqrt(ax * ax + ay * ay + az * az);
 
@@ -615,7 +633,7 @@ void loop() {
     unsigned long now = millis();
 
     if (now - lastCSVMillis > CSV_INTERVAL) {
-        saveDataToCSV(now / 1000, stepCount);
+        saveDataToCSV(now / 1000, stepCount, latestAx, latestAy, latestAz, latestGx, latestGy, latestGz);
 
         portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
