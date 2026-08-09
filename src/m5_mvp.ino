@@ -1,17 +1,46 @@
 #include <M5Unified.h>
 #include <BLEDevice.h>
 #include <BLEScan.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <BLEAdvertising.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
 #include <SD.h>
 #include <time.h>
+#include "cert.h"
 
-#define DEVICE_ID "NODE01"
+#define DEVICE_ID "NODE_B" // 児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
+
+// ======================================================
+// マルチスレッドの構成
+//
+// Core1（歩数と相対距離の取得）
+//   ・loop()
+//       - 歩数計算
+//       - SDカード保存
+//       - 画面描画
+//       - 送信データ作成
+//
+//   ・BLE Task
+//       - BLEスキャン
+//       - devices[] 更新
+//
+// Core0（サーバとのデータ通信）
+//   ・Send Task
+//       - sendFlagを監視
+//       - HTTP通信
+//
+// ======================================================
 
 BLEScan* pBLEScan;
 BLEAdvertising* pAdvertising;
 TaskHandle_t bleTaskHandle;
+TaskHandle_t sendTaskHandle;
 
 portMUX_TYPE sharedStateMux = portMUX_INITIALIZER_UNLOCKED;
+
+unsigned long lastUI = 0; // 画面更新頻度のパラメータ
 
 // =========================
 // 歩数
@@ -19,10 +48,25 @@ portMUX_TYPE sharedStateMux = portMUX_INITIALIZER_UNLOCKED;
 volatile int stepCount = 0;
 
 // =========================
-// BLE
+// IMU（6軸: 加速度・ジャイロ）
+// =========================
+volatile float latestAx = 0, latestAy = 0, latestAz = 0;
+volatile float latestGx = 0, latestGy = 0, latestGz = 0;
+
+// =========================
+// BLE（相対距離）
 // =========================
 volatile int latestRSSI = -100;
 volatile float distanceMeter = -1;
+
+struct SendData {
+    unsigned long timestamp;
+    int steps;
+    float distance;
+};
+
+volatile bool sendFlag = false;
+SendData sendData;
 
 // =========================
 // 複数ノード管理
@@ -42,13 +86,21 @@ int deviceCount = 0;
 // =========================
 char csvFileName[32] = "";
 unsigned long lastCSVMillis = 0;
-const unsigned long CSV_INTERVAL = 10000;
+unsigned long lastFlushMillis = 0;
+unsigned long lastSendMillis = 0;
+const unsigned long CSV_INTERVAL = 100;         // データ取得・バッファ追加間隔 [ms]
+const unsigned long CSV_FLUSH_INTERVAL = 1000;  // バッファをSDへ書き込む間隔 [ms]
+const unsigned long SEND_INTERVAL = 10000;      // サーバへの送信間隔 [ms]
+
+// SDへの書き込み回数を減らすためのバッファ（固定サイズ、ヒープ確保なし）
+#define CSV_BUFFER_SIZE 8192
+char csvBuffer[CSV_BUFFER_SIZE];
+size_t csvBufferLen = 0;
 
 // =========================
-// SD
+// SDカードの初期化
 // =========================
-void initSDCard()
-{
+void initSDCard() {
     if (!SD.begin(4)) {
         Serial.println("SD card initialization failed");
         return;
@@ -57,8 +109,34 @@ void initSDCard()
     Serial.println("SD card initialized");
 }
 
-void createNewCSVFile()
-{
+// =========================
+// NTPによる時刻同期
+// =========================
+void syncTimeWithNTP() {
+    configTime(9 * 3600, 0, "ntp.nict.jp", "time.google.com"); // JST（UTC+9）で同期
+
+    struct tm timeinfo;
+
+    if (getLocalTime(&timeinfo, 5000)) { // 最大5秒待つ
+        Serial.println("NTP time synced");
+    } else {
+        Serial.println("NTP time sync failed");
+    }
+}
+
+// =========================
+// ISO8601形式（UTC）の現在時刻を取得
+// =========================
+void getIsoTimeUTC(char* buffer, size_t size) {
+    time_t now = time(nullptr);
+    struct tm* t = gmtime(&now);
+
+    snprintf(buffer, size, "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+             t->tm_hour, t->tm_min, t->tm_sec);
+}
+
+void createNewCSVFile() {
     time_t now = time(nullptr);
     struct tm* timeinfo = localtime(&now);
 
@@ -69,84 +147,185 @@ void createNewCSVFile()
             timeinfo->tm_mday,
             timeinfo->tm_hour,
             timeinfo->tm_min,
-            timeinfo->tm_sec);
+            timeinfo->tm_sec
+        );
 
     File file = SD.open(csvFileName, FILE_WRITE);
 
     if (file) {
-
-        file.println("Timestamp,Steps,Distance(m)");
+        file.println("Timestamp,Steps,Ax,Ay,Az,Gx,Gy,Gz,NodeID,Distance(m)");
         file.close();
 
-        Serial.printf(
-            "New CSV file created: %s\n",
-            csvFileName
-        );
+        Serial.printf("New CSV file created: %s\n",csvFileName);
     }
 }
 
-void saveDataToCSV(
-    unsigned long timestamp,
-    int steps,
-    float distance)
-{
+// =========================
+// CSVバッファへ1行追記する（バッファが満杯なら先にフラッシュする）
+// =========================
+void appendToCSVBuffer(const char* line) {
+    size_t lineLen = strlen(line);
+
+    if (csvBufferLen + lineLen >= CSV_BUFFER_SIZE)
+        flushCSVBuffer();
+
+    memcpy(csvBuffer + csvBufferLen, line, lineLen);
+    csvBufferLen += lineLen;
+}
+
+// =========================
+// CSVバッファをSDへまとめて書き込む
+// 毎回ファイルをopen/closeする代わりに、一定間隔でまとめて書き込むことで
+// SDカードへのアクセス頻度を抑える
+// =========================
+void flushCSVBuffer() {
+    if (csvFileName[0] == '\0' || csvBufferLen == 0)
+        return;
+
+    File file = SD.open(csvFileName, FILE_APPEND);
+
+    if (file) {
+        file.write((const uint8_t*)csvBuffer, csvBufferLen);
+        file.close();
+    }
+
+    csvBufferLen = 0;
+}
+
+// =========================
+// データをCSVバッファへ書き込む
+// 近接する全ノードの名前と距離をそれぞれ1行ずつ追記する
+// =========================
+void saveDataToCSV(int steps, float ax, float ay, float az, float gx, float gy, float gz) {
     if (csvFileName[0] == '\0')
         return;
 
-    File file =
-        SD.open(csvFileName, FILE_APPEND);
+    char isoTime[32];
+    getIsoTimeUTC(isoTime, sizeof(isoTime));
 
-    if (file) {
+    DeviceInfo nearbyDevices[20];
+    int nearbyCount = 0;
 
-        file.printf(
-            "%lu,%d,%.2f\n",
-            timestamp,
-            steps,
-            distance
-        );
+    portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
-        file.close();
+    for (int i = 0; i < deviceCount; i++) {
+        if (millis() - devices[i].lastSeen > 10000) // 10秒以上検出されていないデバイスは対象外
+            continue;
+
+        nearbyDevices[nearbyCount] = devices[i];
+        nearbyCount++;
     }
+
+    portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+
+    char line[160];
+
+    if (nearbyCount == 0) {
+        // 近接ノードがいない場合も歩数・6軸データだけは記録する
+        snprintf(line, sizeof(line), "%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,,\n", isoTime, steps, ax, ay, az, gx, gy, gz);
+        appendToCSVBuffer(line);
+    } else {
+        for (int i = 0; i < nearbyCount; i++) {
+            snprintf(line, sizeof(line), "%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%.2f\n",
+                     isoTime, steps, ax, ay, az, gx, gy, gz,
+                     nearbyDevices[i].id.c_str(), nearbyDevices[i].distance);
+            appendToCSVBuffer(line);
+        }
+    }
+}
+
+// =========================
+// 歩数計算
+// =========================
+void updateStepCount() {
+    static float gravity = 1.0f;
+    static float filtered = 0.0f;
+    static float prevFiltered = 0.0f;
+    static bool rising = false;
+    static unsigned long lastStepMillis = 0;
+    static bool calibrated = false;
+
+    const float ALPHA = 0.92f;
+    const float STEP_THRESHOLD = 0.18f;
+    const unsigned long STEP_INTERVAL = 300;
+
+    if (!calibrated) {
+        for (int i = 0; i < 40; i++) {
+            float ax, ay, az;
+
+            M5.Imu.getAccelData(&ax, &ay, &az);
+
+            float accelMagnitude = sqrt(ax * ax + ay * ay + az * az);
+
+            gravity = gravity * 0.9f + accelMagnitude * 0.1f;
+
+            delay(20);
+        }
+
+        calibrated = true;
+    }
+
+    float ax, ay, az;
+    float gx, gy, gz;
+
+    M5.Imu.getAccelData(&ax, &ay, &az);
+    M5.Imu.getGyroData(&gx, &gy, &gz);
+
+    latestAx = ax;
+    latestAy = ay;
+    latestAz = az;
+    latestGx = gx;
+    latestGy = gy;
+    latestGz = gz;
+
+    float accelMagnitude = sqrt(ax * ax + ay * ay + az * az);
+
+    gravity = gravity * ALPHA + accelMagnitude * (1.0f - ALPHA);
+    filtered = accelMagnitude - gravity;
+
+    bool currentRising = filtered > prevFiltered;
+
+    if (rising && !currentRising && prevFiltered > STEP_THRESHOLD) {
+        unsigned long now = millis();
+
+        if (now - lastStepMillis > STEP_INTERVAL) {
+            stepCount++;
+            lastStepMillis = now;
+
+            Serial.printf("STEP %d\n", stepCount);
+        }
+    }
+
+    rising = currentRising;
+    prevFiltered = filtered;
 }
 
 // =========================
 // 距離計算
 // =========================
-float calculateDistance(int rssi)
-{
+float calculateDistance(int rssi) {
     int txPower = -59;
 
     if (rssi == 0)
         return -1;
 
-    float ratio =
-        rssi * 1.0 / txPower;
+    float ratio = rssi * 1.0 / txPower;
 
     if (ratio < 1.0) {
-
         return pow(ratio, 10);
     }
 
-    return
-        0.89976 *
-        pow(ratio, 7.7095)
-        + 0.111;
+    return 0.89976 * pow(ratio, 7.7095) + 0.111; // 信号強度計算
 }
 
 // =========================
 // ノード更新
 // =========================
-void updateDevice(
-    String id,
-    int rssi)
-{
-    float distance =
-        calculateDistance(rssi);
+void updateDevice(String id, int rssi) {
+    float distance = calculateDistance(rssi);
 
     for (int i = 0; i < deviceCount; i++) {
-
         if (devices[i].id == id) {
-
             devices[i].rssi = rssi;
             devices[i].distance = distance;
             devices[i].lastSeen = millis();
@@ -156,7 +335,6 @@ void updateDevice(
     }
 
     if (deviceCount < 20) {
-
         devices[deviceCount].id = id;
         devices[deviceCount].rssi = rssi;
         devices[deviceCount].distance = distance;
@@ -169,140 +347,193 @@ void updateDevice(
 // =========================
 // BLE callback
 // =========================
-class MyCallbacks :
-    public BLEAdvertisedDeviceCallbacks {
+class MyCallbacks : public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice device) {
+        String name = device.getName().c_str();
 
-    void onResult(
-        BLEAdvertisedDevice device)
-    {
-        String name =
-            device.getName().c_str();
-
-        if (!name.startsWith("NODE"))
+        if (!name.startsWith("NODE") || name == DEVICE_ID)
             return;
 
-        if (name == DEVICE_ID)
-            return;
+        int rssi = device.getRSSI();
+        float distance = calculateDistance(rssi);
 
-        int rssi =
-            device.getRSSI();
-
-        float distance =
-            calculateDistance(rssi);
+        portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
         updateDevice(name, rssi);
-
-        portENTER_CRITICAL(
-            &sharedStateMux);
 
         latestRSSI = rssi;
         distanceMeter = distance;
 
-        portEXIT_CRITICAL(
-            &sharedStateMux);
+        portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
-        Serial.printf(
-            "%s RSSI=%d Dist=%.2f\n",
-            name.c_str(),
-            rssi,
-            distance
-        );
+        Serial.printf("%s RSSI=%d Dist=%.2f\n", name.c_str(), rssi, distance);
     }
 };
 
 // =========================
-// BLE task
+// BLE通信用スレッド
 // =========================
-void bleTask(void *arg)
-{
+void bleTask(void *arg) {
     while (true) {
-
-        pBLEScan->start(
-            1,
-            false
-        );
-
+        pBLEScan->start(1, false);
         pBLEScan->clearResults();
 
-        vTaskDelay(
-            200 / portTICK_PERIOD_MS
-        );
+        vTaskDelay(200 / portTICK_PERIOD_MS);
     }
 }
 
 // =========================
-// UI
+// サーバとの通信用スレッド
 // =========================
-void drawUI()
+void sendTask(void *arg)
 {
-    M5.Display.fillScreen(
-        TFT_NAVY);
+    while (true) {
+        if (sendFlag) {
+            portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
-    M5.Display.setTextColor(
-        WHITE);
+            // ローカル変数へコピーしてから送信する
+            SendData data = sendData;
+            sendFlag = false;
 
+            portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+
+            sendDataToServer(data.timestamp, data.steps, data.distance);
+        }
+
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+}
+
+// =========================
+// child_idの取得
+// =========================
+int getChildId(const String& deviceName) {
+    // DBから児童の名前に対応したidを照合する
+
+    return 1;
+}
+
+// =========================
+// UI初期描画
+// =========================
+void drawUIBase() {
+    M5.Display.fillScreen(BLACK);
+    M5.Display.setTextColor(WHITE);
+    M5.Display.setBrightness(40); //画面明るさ
+
+    // デバイス名
     M5.Display.setTextSize(5);
-
     M5.Display.setCursor(20, 20);
-    M5.Display.println(DEVICE_ID);
+    M5.Display.println(String(DEVICE_ID).substring(5)); // NODE_の部分は削って表示させる
 
+    // STEPのラベル
     M5.Display.setTextSize(3);
-
     M5.Display.setCursor(20, 90);
+    M5.Display.printf("STEP:");
+}
 
-    M5.Display.printf(
-        "STEP: %d",
-        stepCount
-    );
+// =========================
+// STEP部分のUI更新
+// =========================
+void updateStepUI() {
+    static int oldStep = -1;
 
-    int y = 140;
+    // 表示する値が変わっていない場合は更新する必要がない
+    if (oldStep == stepCount)
+        return;
 
+    oldStep = stepCount; // 以前の値を覚えておく
+
+    // 数字だけ消す
+    M5.Display.fillRect(120, 90, 120, 30, BLACK);
+
+    M5.Display.setTextColor(WHITE);
+    M5.Display.setTextSize(3);
+    M5.Display.setCursor(120, 90);
+    M5.Display.printf("%d", stepCount);
+}
+
+// =========================
+// 相対距離の表示のUI更新
+// =========================
+void updateDistanceUI() {
+    const int listX = 20;
+    const int listY = 140;
+    const int listW = 300;
+    const int listH = 60;
+    
+    M5.Display.fillRect(listX, listY, listW, listH, ILI9341_BLACK);
+
+    M5.Display.setTextColor(WHITE);
     M5.Display.setTextSize(2);
 
-    for (int i = 0; i < deviceCount; i++) {
+    int y = listY;
 
-        if (
-            millis()
-            - devices[i].lastSeen
-            > 10000)
+    portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+
+    for (int i = 0; i < deviceCount; i++) {
+        if (millis() - devices[i].lastSeen > 10000)
             continue;
 
-        M5.Display.setCursor(
-            20,
-            y
-        );
+        // BATエリアに文字が被らないようにする
+        if (y + 25 > listY + listH)
+            break;
 
-        M5.Display.printf(
-            "%s %.1fm",
-            devices[i].id.c_str(),
-            devices[i].distance
-        );
+        M5.Display.setCursor(listX, y);
+
+        // NODE_の部分は削って相対距離の相手の名前は表示させる
+        M5.Display.printf("%s %.1fm", devices[i].id.substring(5).c_str(), devices[i].distance);
 
         y += 25;
     }
 
-    int battery =
-        M5.Power.getBatteryLevel();
-
-    M5.Display.setTextColor(
-        TFT_YELLOW);
-
-    M5.Display.setCursor(
-        M5.Display.width() - 110,
-        M5.Display.height() - 30
-    );
-
-    M5.Display.printf(
-        "%d%%",
-        battery
-    );
+    portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避    
 }
 
 // =========================
-// setup
+// Battery部分のUI更新
 // =========================
-void setup()
-{
+void updateBatteryUI() {
+    static int oldBattery = -1;
+
+    int battery = M5.Power.getBatteryLevel();
+
+    // 取得失敗（-1などの無効値）は無視して、前回表示を維持する
+    if (battery < 0)
+        return;
+    
+    // 表示する値が変わっていない場合は更新する必要がない
+    if (battery == oldBattery)
+        return;
+
+    oldBattery = battery; // 以前の値を覚えておく
+
+    const int x = M5.Display.width() - 160;
+    const int y = M5.Display.height() - 30;
+    const int w = 160;
+    const int h = 30;
+
+    M5.Display.fillRect(x, y, w, h, BLACK);
+
+    M5.Display.setTextColor(TFT_YELLOW);
+    M5.Display.setTextSize(3);
+    M5.Display.setCursor(x, y);
+    M5.Display.printf("BAT:%d%%", battery);
+}
+
+// =========================
+// UI描画（部分の更新のみ）
+// =========================
+void drawUI() {
+    updateStepUI();
+    updateDistanceUI();
+    updateBatteryUI();
+}
+
+// =========================
+// デバイスのセットアップ
+// =========================
+void setup() {
     auto cfg = M5.config();
 
     cfg.serial_baudrate = 115200;
@@ -317,191 +548,162 @@ void setup()
     M5.Display.setRotation(1);
 
     initSDCard();
-    createNewCSVFile();
 
-    // BLE
-    BLEDevice::init(
-        DEVICE_ID
-    );
+    BLEDevice::init(DEVICE_ID);
 
-    // Advertising
-    pAdvertising =
-        BLEDevice::getAdvertising();
+    pAdvertising = BLEDevice::getAdvertising();
 
     BLEAdvertisementData advData;
 
-    advData.setName(
-        DEVICE_ID
-    );
+    advData.setName(DEVICE_ID);
 
-    pAdvertising->setAdvertisementData(
-        advData
-    );
+    pAdvertising->setAdvertisementData(advData);
 
     pAdvertising->start();
+    
+    pBLEScan = BLEDevice::getScan(); // Scan
 
-    // Scan
-    pBLEScan =
-        BLEDevice::getScan();
-
-    pBLEScan->setAdvertisedDeviceCallbacks(
-        new MyCallbacks()
-    );
+    pBLEScan->setAdvertisedDeviceCallbacks(new MyCallbacks());
 
     pBLEScan->setActiveScan(true);
     pBLEScan->setInterval(100);
     pBLEScan->setWindow(80);
 
-    xTaskCreatePinnedToCore(
-        bleTask,
-        "BLE",
-        4096,
-        NULL,
-        2,
-        &bleTaskHandle,
-        1
-    );
+    xTaskCreatePinnedToCore(bleTask, "BLE", 4096, NULL, 2, &bleTaskHandle, 1);
+    xTaskCreatePinnedToCore(sendTask, "SEND", 8192, NULL, 1, &sendTaskHandle, 0);
+
+    // Wi-Fiへの接続を行う
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+    int dotCount = 0;
+    const int WIFI_CONNECT_DOT_INTERVAL_MS = 500; // ドット表示間隔 [ms]
+    const int WIFI_CONNECT_TIMEOUT_DOTS = 20; // タイムアウトまでのドット数
+
+    while (WiFi.status() != WL_CONNECTED && dotCount < WIFI_CONNECT_TIMEOUT_DOTS) {
+        delay(WIFI_CONNECT_DOT_INTERVAL_MS); // Wi-Fi接続試行中にはドットを表示していく
+        M5.Lcd.print(".");
+        dotCount++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.println("WiFi connected"); // Wi-Fi接続完了
+        M5.Lcd.print("IP address = ");
+        M5.Lcd.println(WiFi.localIP()); // デバイスのローカルIPアドレスを表示
+
+        syncTimeWithNTP(); // Wi-Fi接続時のみ時刻同期
+    } else {
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.println("WiFi Timeout"); // Wi-Fi接続タイムアウト
+    }
+
+    createNewCSVFile(); // 同期できていればその時刻でファイル名を生成する
+
+    drawUIBase(); // UIの初期描画
+    updateBatteryUI(); // 初回のバッテリー残量を表示
 }
 
 // =========================
-// loop
+// Wi-Fi経由のデータ送信
 // =========================
-void loop()
-{
-    static float gravity = 1.0f;
-    static float filtered = 0.0f;
-    static float prevFiltered = 0.0f;
-
-    static bool rising = false;
-
-    static unsigned long lastStepMillis = 0;
-
-    static unsigned long lastUI = 0;
-
-    static bool calibrated = false;
-
-    const float ALPHA = 0.92f;
-    const float STEP_THRESHOLD = 0.18f;
-    const unsigned long STEP_INTERVAL = 300;
-
-    if (!calibrated) {
-
-        for (int i = 0; i < 40; i++) {
-
-            float ax, ay, az;
-
-            M5.Imu.getAccelData(
-                &ax,
-                &ay,
-                &az
-            );
-
-            float accelMagnitude =
-                sqrt(
-                    ax * ax +
-                    ay * ay +
-                    az * az
-                );
-
-            gravity =
-                gravity * 0.9f +
-                accelMagnitude * 0.1f;
-
-            delay(20);
-        }
-
-        calibrated = true;
+void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot) {
+    // Wi-Fiのコネクションを確認
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi not connected!");
+        return;
     }
 
-    float ax, ay, az;
+    // ISOタイムスタンプ生成
+    char isoTime[32];
+    getIsoTimeUTC(isoTime, sizeof(isoTime));
 
-    M5.Imu.getAccelData(
-        &ax,
-        &ay,
-        &az
-    );
+    // JSON組み立て（512バイトに拡張）
+    StaticJsonDocument<512> doc;
 
-    float accelMagnitude =
-        sqrt(
-            ax * ax +
-            ay * ay +
-            az * az
-        );
+    // 自分の児童IDをDBから参照して設定
+    doc["child_id"] = getChildId(DEVICE_ID);
 
-    gravity =
-        gravity * ALPHA +
-        accelMagnitude * (1.0f - ALPHA);
+    // 歩数情報を格納
+    JsonObject singledata = doc.createNestedObject("singledata");
+    singledata["date"] = isoTime; // タイムスタンプ
+    singledata["steps"] = steps; // 歩数情報
 
-    filtered =
-        accelMagnitude - gravity;
+    portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
-    bool currentRising =
-        filtered > prevFiltered;
+    // 相対距離情報を格納（近くにいるデバイス分だけ追加）
+    JsonArray distances = doc.createNestedArray("distances");
+    for (int i = 0; i < deviceCount; i++) {
+        // 10秒以上検出されていないデバイスは送信しない
+        if (millis() - devices[i].lastSeen > 10000) 
+            continue;
 
-    if (
-        rising &&
-        !currentRising &&
-        prevFiltered > STEP_THRESHOLD
-    ) {
+        JsonObject dist = distances.createNestedObject();
 
-        unsigned long now =
-            millis();
-
-        if (
-            now - lastStepMillis >
-            STEP_INTERVAL
-        ) {
-
-            stepCount++;
-
-            lastStepMillis = now;
-
-            Serial.printf(
-                "STEP %d\n",
-                stepCount
-            );
-        }
+        dist["date"] = isoTime; // タイムスタンプ
+        // dist["with_child"] = getChildId(devices[i].id); // 測定した相手のID
+        dist["with_child"] = 2; // テスト用に定数でID=2を設定
+        dist["distance"] = devices[i].distance; // 相対距離情報
     }
 
-    rising = currentRising;
-    prevFiltered = filtered;
+    portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
-    unsigned long now =
-        millis();
+    // JSONを文字列へ変換
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    Serial.println("Sending: " + jsonStr);
 
-    if (
-        now - lastCSVMillis >
-        CSV_INTERVAL
-    ) {
+    // HTTPのPOSTでサーバへデータを送信するようにする
+    HTTPClient http;
+    http.begin(API_URL); // APIサーバのURLを設定
+    http.addHeader("Content-Type", "application/json");
 
-        float distanceSnapshot;
+    int httpResponseCode = http.POST(jsonStr);
 
-        portENTER_CRITICAL(
-            &sharedStateMux);
+    if (httpResponseCode > 0) {
+        Serial.println("HTTP Response: " + String(httpResponseCode));
+        String response = http.getString();
+        Serial.println("Response: " + response);
+    } else {
+        Serial.println("Error: " + String(httpResponseCode));
+    }
 
-        distanceSnapshot =
-            distanceMeter;
+    http.end();
+}
 
-        portEXIT_CRITICAL(
-            &sharedStateMux);
+// =========================
+// メインループ
+// =========================
+void loop() {
+    updateStepCount(); // 歩数計算
 
-        saveDataToCSV(
-            now / 1000,
-            stepCount,
-            distanceSnapshot
-        );
+    unsigned long now = millis();
 
+    if (now - lastCSVMillis > CSV_INTERVAL) { // 0.1秒ごとにバッファへ取得・追記
+        saveDataToCSV(stepCount, latestAx, latestAy, latestAz, latestGx, latestGy, latestGz);
         lastCSVMillis = now;
     }
 
-    if (
-        millis() - lastUI >
-        5000
-    ) {
+    if (now - lastFlushMillis > CSV_FLUSH_INTERVAL) { // 1秒ごとにまとめてSDへ書き込む
+        flushCSVBuffer();
+        lastFlushMillis = now;
+    }
 
-        drawUI();
+    if (now - lastSendMillis > SEND_INTERVAL) { // 10秒ごとにサーバへ送信
+        portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
-        lastUI = millis();
+        sendData.timestamp = now / 1000;
+        sendData.steps = stepCount;
+        sendData.distance = distanceMeter;
+        sendFlag = true;
+
+        portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+
+        lastSendMillis = now;
+    }
+
+    if (now - lastUI > 10000) { //10秒ごとの更新
+        drawUI(); // 必要な部分だけ数値の表示を更新する
+        lastUI = now;
     }
 
     delay(30);
