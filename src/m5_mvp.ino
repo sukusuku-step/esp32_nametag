@@ -48,10 +48,11 @@ unsigned long lastUI = 0; // 画面更新頻度のパラメータ
 volatile int stepCount = 0;
 
 // =========================
-// IMU（6軸: 加速度・ジャイロ）
+// IMU（9軸: 加速度・ジャイロ・地磁気）
 // =========================
 volatile float latestAx = 0, latestAy = 0, latestAz = 0;
 volatile float latestGx = 0, latestGy = 0, latestGz = 0;
+volatile float latestMx = 0, latestMy = 0, latestMz = 0;
 
 // =========================
 // BLE（相対距離）
@@ -153,7 +154,7 @@ void createNewCSVFile() {
     File file = SD.open(csvFileName, FILE_WRITE);
 
     if (file) {
-        file.println("Timestamp,Steps,Ax,Ay,Az,Gx,Gy,Gz,NodeID,Distance(m)");
+        file.println("Timestamp,Steps,Ax,Ay,Az,Gx,Gy,Gz,Mx,My,Mz,NodeID,Distance(m)");
         file.close();
 
         Serial.printf("New CSV file created: %s\n",csvFileName);
@@ -196,7 +197,7 @@ void flushCSVBuffer() {
 // データをCSVバッファへ書き込む
 // 近接する全ノードの名前と距離をそれぞれ1行ずつ追記する
 // =========================
-void saveDataToCSV(int steps, float ax, float ay, float az, float gx, float gy, float gz) {
+void saveDataToCSV(int steps, float ax, float ay, float az, float gx, float gy, float gz, float mx, float my, float mz) {
     if (csvFileName[0] == '\0')
         return;
 
@@ -218,16 +219,17 @@ void saveDataToCSV(int steps, float ax, float ay, float az, float gx, float gy, 
 
     portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
-    char line[160];
+    char line[200];
 
     if (nearbyCount == 0) {
-        // 近接ノードがいない場合も歩数・6軸データだけは記録する
-        snprintf(line, sizeof(line), "%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,,\n", isoTime, steps, ax, ay, az, gx, gy, gz);
+        // 近接ノードがいない場合も歩数・9軸データだけは記録する
+        snprintf(line, sizeof(line), "%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,,\n",
+                 isoTime, steps, ax, ay, az, gx, gy, gz, mx, my, mz);
         appendToCSVBuffer(line);
     } else {
         for (int i = 0; i < nearbyCount; i++) {
-            snprintf(line, sizeof(line), "%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%.2f\n",
-                     isoTime, steps, ax, ay, az, gx, gy, gz,
+            snprintf(line, sizeof(line), "%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%.2f\n",
+                     isoTime, steps, ax, ay, az, gx, gy, gz, mx, my, mz,
                      nearbyDevices[i].id.c_str(), nearbyDevices[i].distance);
             appendToCSVBuffer(line);
         }
@@ -267,9 +269,11 @@ void updateStepCount() {
 
     float ax, ay, az;
     float gx, gy, gz;
+    float mx, my, mz;
 
     M5.Imu.getAccelData(&ax, &ay, &az);
     M5.Imu.getGyroData(&gx, &gy, &gz);
+    M5.Imu.getMag(&mx, &my, &mz);
 
     latestAx = ax;
     latestAy = ay;
@@ -277,6 +281,9 @@ void updateStepCount() {
     latestGx = gx;
     latestGy = gy;
     latestGz = gz;
+    latestMx = mx;
+    latestMy = my;
+    latestMz = mz;
 
     float accelMagnitude = sqrt(ax * ax + ay * ay + az * az);
 
@@ -679,7 +686,7 @@ void loop() {
     unsigned long now = millis();
 
     if (now - lastCSVMillis > CSV_INTERVAL) { // 0.1秒ごとにバッファへ取得・追記
-        saveDataToCSV(stepCount, latestAx, latestAy, latestAz, latestGx, latestGy, latestGz);
+        saveDataToCSV(stepCount, latestAx, latestAy, latestAz, latestGx, latestGy, latestGz, latestMx, latestMy, latestMz);
         lastCSVMillis = now;
     }
 
