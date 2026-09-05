@@ -10,8 +10,6 @@
 #include <time.h>
 #include "cert.h"
 
-#define DEVICE_ID "NODE_TARO" // 児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
-
 // ======================================================
 // マルチスレッドの構成
 //
@@ -33,76 +31,25 @@
 //
 // ======================================================
 
-// =========================
-// child_idの取得
-// =========================
-int getChildId(const String& deviceName) {
-    // DBから児童の名前に対応したidを照合する
+// ======================================================
+// グローバル変数・マクロ変数の設定
+// ======================================================
 
-    return 1;
-}
+#define DEVICE_ID "NODE_TARO" // 対応する児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
+#define CSV_BUFFER_SIZE 8192 // CSVバッファのサイズ
+#define MAX_DISTANCE_COLUMNS 30 // CSVバッファのDistanceカラムの最大値
 
-// 指定したID値が現在存在するかどうかを確認する
-bool hasDistanceColumn(int childId) {
-    for (int i = 0; i < distanceColumnCount; i++) {
-        if (distanceChildIds[i] == childId) return true;
-    }
-    return false;
-}
-
-BLEScan* pBLEScan;
-BLEAdvertising* pAdvertising;
-TaskHandle_t bleTaskHandle;
-TaskHandle_t sendTaskHandle;
-
-portMUX_TYPE sharedStateMux = portMUX_INITIALIZER_UNLOCKED;
-
-unsigned long lastUI = 0; // 画面更新頻度のパラメータ
-
-// =========================
-// 歩数
-// =========================
+// 累計歩数のカウント
 volatile int stepCount = 0;
 
-// =========================
 // IMU（9軸: 加速度・ジャイロ・地磁気）
-// =========================
 volatile float latestAx = 0, latestAy = 0, latestAz = 0;
 volatile float latestGx = 0, latestGy = 0, latestGz = 0;
 volatile float latestMx = 0, latestMy = 0, latestMz = 0;
 
-// =========================
 // BLE（相対距離）
-// =========================
 volatile int latestRSSI = -100;
 volatile float distanceMeter = -1;
-
-struct SendData {
-    unsigned long timestamp;
-    int steps;
-    float distance;
-};
-
-volatile bool sendFlag = false;
-SendData sendData;
-
-// =========================
-// 複数ノード管理
-// =========================
-struct DeviceInfo {
-    String id;
-    int rssi;
-    float distance;
-    unsigned long lastSeen;
-};
-
-DeviceInfo devices[20];
-int deviceCount = 0;
-
-// =========================
-// SD / CSV
-// =========================
-#define MAX_DISTANCE_COLUMNS 20
 
 int distanceChildIds[MAX_DISTANCE_COLUMNS];
 int distanceColumnCount = 0;
@@ -117,18 +64,202 @@ unsigned long lastCSVMillis = 0;
 unsigned long lastFlushMillis = 0;
 unsigned long lastSendMillis = 0;
 
-const unsigned long CSV_INTERVAL = 100; // データのセンシング周期 [ms]
+// センシング自体はメインループのクロック周期に依存する
+
+const unsigned long CSV_INTERVAL = 100; // CSVバッファへの記録周期 [ms]
 const unsigned long CSV_FLUSH_INTERVAL = 1000; // 計測データをSDへ書き込む周期 [ms]
 const unsigned long SEND_INTERVAL = 10000; // 計測データのサーバへの送信周期 [ms]
 
-// SDへの書き込み回数を減らすためのバッファ（固定サイズ、ヒープ確保なし）
-#define CSV_BUFFER_SIZE 8192
+// ======================================================
+// 児童ID・BLEデバイス管理
+// ======================================================
+
+// 児童名から対応するchild_idを取得する関数
+int getChildId(const String& deviceName) {
+    // DBから児童の名前に対応したidを照合する
+
+    return 1;
+}
+
+// 指定したID値が現在存在しているかどうかを確認する関数
+bool hasDistanceColumn(int childId) {
+    for (int i = 0; i < distanceColumnCount; i++) {
+        if (distanceChildIds[i] == childId) return true;
+    }
+    return false;
+}
+
+// 信号強度からの相対距離計算用の関数
+float calculateDistance(int rssi) {
+    int txPower = -59;
+
+    if (rssi == 0)
+        return -1;
+
+    float ratio = rssi * 1.0 / txPower;
+
+    if (ratio < 1.0) {
+        return pow(ratio, 10);
+    }
+
+    return 0.89976 * pow(ratio, 7.7095) + 0.111; // 信号強度計算
+}
+
+BLEScan* pBLEScan;
+BLEAdvertising* pAdvertising;
+TaskHandle_t bleTaskHandle;
+TaskHandle_t sendTaskHandle;
+portMUX_TYPE sharedStateMux = portMUX_INITIALIZER_UNLOCKED;
+
+struct SendData {
+    unsigned long timestamp;
+    int steps;
+    float distance;
+};
+
+volatile bool sendFlag = false;
+SendData sendData;
+
+// 複数ノードの管理
+struct DeviceInfo {
+    String id;
+    int rssi;
+    float distance;
+    unsigned long lastSeen;
+};
+
+DeviceInfo devices[20];
+int deviceCount = 0;
+
+// ノード更新
+void updateDevice(String id, int rssi) {
+    float distance = calculateDistance(rssi);
+
+    for (int i = 0; i < deviceCount; i++) {
+        if (devices[i].id == id) {
+            devices[i].rssi = rssi;
+            devices[i].distance = distance;
+            devices[i].lastSeen = millis();
+
+            return;
+        }
+    }
+
+    if (deviceCount < 20) {
+        devices[deviceCount].id = id;
+        devices[deviceCount].rssi = rssi;
+        devices[deviceCount].distance = distance;
+        devices[deviceCount].lastSeen = millis();
+
+        deviceCount++;
+    }
+}
+
+// BLE callback
+class MyCallbacks : public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice device) {
+        String name = device.getName().c_str();
+
+        if (!name.startsWith("NODE") || name == DEVICE_ID)
+            return;
+
+        int rssi = device.getRSSI();
+        float distance = calculateDistance(rssi);
+
+        portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+
+        updateDevice(name, rssi);
+
+        latestRSSI = rssi;
+        distanceMeter = distance;
+
+        portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+
+        Serial.printf("%s RSSI=%d Dist=%.2f\n", name.c_str(), rssi, distance);
+    }
+};
+
+// BLE通信用スレッド
+void bleTask(void *arg) {
+    while (true) {
+        pBLEScan->start(1, false);
+        pBLEScan->clearResults();
+
+        vTaskDelay(200 / portTICK_PERIOD_MS);
+    }
+}
+
+// ======================================================
+// センシング・歩数計算
+// ======================================================
+
+// 値をセンシングして最新値を更新する
+void updateSensors() {
+    float ax, ay, az, gx, gy, gz, mx, my, mz;
+
+    M5.Imu.getAccelData(&ax, &ay, &az);
+    M5.Imu.getGyroData(&gx, &gy, &gz);
+    M5.Imu.getMag(&mx, &my, &mz);
+
+    latestAx = ax; latestAy = ay; latestAz = az;
+    latestGx = gx; latestGy = gy; latestGz = gz;
+    latestMx = mx; latestMy = my; latestMz = mz;
+}
+
+// 加速度からの歩数計算用関数
+void updateStepCount() {
+    static float gravity = 1.0f;
+    static float filtered = 0.0f;
+    static float prevFiltered = 0.0f;
+    static bool rising = false;
+    static unsigned long lastStepMillis = 0;
+    static int calibrationCount = 0;
+
+    const float ALPHA = 0.92f;
+    const float STEP_THRESHOLD = 0.18f;
+    const unsigned long STEP_INTERVAL = 300;
+
+    float accelMagnitude = sqrt(
+        latestAx * latestAx +
+        latestAy * latestAy +
+        latestAz * latestAz
+    );
+
+    // 起動直後の重力加速度を簡易キャリブレーション
+    if (calibrationCount < 40) {
+        gravity = gravity * 0.9f + accelMagnitude * 0.1f;
+        calibrationCount++;
+        return;
+    }
+
+    gravity = gravity * ALPHA + accelMagnitude * (1.0f - ALPHA);
+    filtered = accelMagnitude - gravity;
+
+    bool currentRising = filtered > prevFiltered;
+
+    if (rising && !currentRising && prevFiltered > STEP_THRESHOLD) {
+        unsigned long now = millis();
+
+        if (now - lastStepMillis > STEP_INTERVAL) {
+            stepCount++;
+            lastStepMillis = now;
+            Serial.printf("STEP %d\n", stepCount);
+        }
+    }
+
+    rising = currentRising;
+    prevFiltered = filtered;
+}
+
+// ======================================================
+// CSVバッファの作成・SDカードへの保存
+// ======================================================
+
+// SDへの書き込み回数を減らすためのCSVバッファ（固定サイズ、ヒープ確保なし）
 char csvBuffer[CSV_BUFFER_SIZE];
 size_t csvBufferLen = 0;
 
-// =========================
 // SDカードの初期化
-// =========================
 void initSDCard() {
     if (!SD.begin(4)) {
         Serial.println("SD card initialization failed");
@@ -138,9 +269,7 @@ void initSDCard() {
     Serial.println("SD card initialized");
 }
 
-// =========================
 // NTPによる時刻同期
-// =========================
 void syncTimeWithNTP() {
     configTime(9 * 3600, 0, "ntp.nict.jp", "time.google.com"); // JST（UTC+9）で同期
 
@@ -154,9 +283,7 @@ void syncTimeWithNTP() {
     }
 }
 
-// =========================
-// 計測開始時刻を取得
-// =========================
+// 計測開始時刻を取得する関数
 void getStartTime(char* buffer, size_t size) {
     time_t now = time(nullptr);
     struct tm* t = gmtime(&now);
@@ -167,6 +294,7 @@ void getStartTime(char* buffer, size_t size) {
             t->tm_hour, t->tm_min, t->tm_sec);
 }
 
+// CSVバッファを作成する関数
 void createNewCSVFile() {
     time_t now = time(nullptr);
     struct tm* t = localtime(&now);
@@ -195,16 +323,39 @@ void createNewCSVFile() {
     Serial.print("Start: ");
     Serial.println(measurementStartTime);
 
-    // 最初はDistanceの列を作らない
+    // 最初はDistanceの列を作らないようにする
 }
 
-// Distance列を後から追加する関数
+// CSVバッファへ1行追記する（バッファが満杯なら先にフラッシュ）
+void appendToCSVBuffer(const char* line) {
+    size_t lineLen = strlen(line);
+
+    if (csvBufferLen + lineLen >= CSV_BUFFER_SIZE)
+        flushCSVBuffer();
+
+    memcpy(csvBuffer + csvBufferLen, line, lineLen);
+    csvBufferLen += lineLen;
+}
+
+// CSVバッファをSDへまとめて書き込む（一定間隔でまとめて書き込む）
+void flushCSVBuffer() {
+    if (csvFileName[0] == '\0' || csvBufferLen == 0)
+        return;
+
+    File file = SD.open(csvFileName, FILE_APPEND);
+
+    if (file) {
+        file.write((const uint8_t*)csvBuffer, csvBufferLen);
+        file.close();
+    }
+
+    csvBufferLen = 0;
+}
+
+// Distance列を後から追加する関数（検出されたデバイス数に合わせる）
 bool addDistanceColumn(int childId) {
     if (hasDistanceColumn(childId)) return true;
-    if (distanceColumnCount >= MAX_DISTANCE_COLUMNS) {
-        Serial.println("Maximum distance columns reached.");
-        return false;
-    }
+    if (distanceColumnCount >= MAX_DISTANCE_COLUMNS) return false;
 
     flushCSVBuffer();
 
@@ -215,7 +366,6 @@ bool addDistanceColumn(int childId) {
     File dst = SD.open(tempFileName, FILE_WRITE);
 
     if (!src || !dst) {
-        Serial.println("Failed to open CSV for column addition.");
         if (src) src.close();
         if (dst) dst.close();
         return false;
@@ -300,42 +450,7 @@ void updateDistanceColumns() {
     }
 }
 
-// =========================
-// CSVバッファへ1行追記する（バッファが満杯なら先にフラッシュする）
-// =========================
-void appendToCSVBuffer(const char* line) {
-    size_t lineLen = strlen(line);
-
-    if (csvBufferLen + lineLen >= CSV_BUFFER_SIZE)
-        flushCSVBuffer();
-
-    memcpy(csvBuffer + csvBufferLen, line, lineLen);
-    csvBufferLen += lineLen;
-}
-
-// =========================
-// CSVバッファをSDへまとめて書き込む
-// 毎回ファイルをopen/closeする代わりに、一定間隔でまとめて書き込むことで
-// SDカードへのアクセス頻度を抑える
-// =========================
-void flushCSVBuffer() {
-    if (csvFileName[0] == '\0' || csvBufferLen == 0)
-        return;
-
-    File file = SD.open(csvFileName, FILE_APPEND);
-
-    if (file) {
-        file.write((const uint8_t*)csvBuffer, csvBufferLen);
-        file.close();
-    }
-
-    csvBufferLen = 0;
-}
-
-// =========================
-// データをCSVバッファへ書き込む
-// 近接する全ノードの名前と距離をそれぞれ1行ずつ追記する
-// =========================
+// 計測データをCSVバッファへ書き込む関数
 void saveDataToCSV() {
     updateDistanceColumns();
 
@@ -414,153 +529,76 @@ void saveDataToCSV() {
     csvSampleCount++;
 }
 
-// =========================
-// センサー値を取得して最新値を更新
-// =========================
-void updateSensors() {
-    float ax, ay, az, gx, gy, gz, mx, my, mz;
+// ======================================================
+// サーバとの通信処理
+// ======================================================
 
-    M5.Imu.getAccelData(&ax, &ay, &az);
-    M5.Imu.getGyroData(&gx, &gy, &gz);
-    M5.Imu.getMag(&mx, &my, &mz);
-
-    latestAx = ax; latestAy = ay; latestAz = az;
-    latestGx = gx; latestGy = gy; latestGz = gz;
-    latestMx = mx; latestMy = my; latestMz = mz;
-}
-
-// =========================
-// 加速度からの歩数計算
-// =========================
-void updateStepCount() {
-    static float gravity = 1.0f;
-    static float filtered = 0.0f;
-    static float prevFiltered = 0.0f;
-    static bool rising = false;
-    static unsigned long lastStepMillis = 0;
-    static int calibrationCount = 0;
-
-    const float ALPHA = 0.92f;
-    const float STEP_THRESHOLD = 0.18f;
-    const unsigned long STEP_INTERVAL = 300;
-
-    float accelMagnitude = sqrt(
-        latestAx * latestAx +
-        latestAy * latestAy +
-        latestAz * latestAz
-    );
-
-    // 起動直後の重力加速度を簡易キャリブレーション
-    if (calibrationCount < 40) {
-        gravity = gravity * 0.9f + accelMagnitude * 0.1f;
-        calibrationCount++;
+// Wi-Fi経由のデータ送信を行う関数
+void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot) {
+    // Wi-Fiのコネクションを確認
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi not connected!");
         return;
     }
 
-    gravity = gravity * ALPHA + accelMagnitude * (1.0f - ALPHA);
-    filtered = accelMagnitude - gravity;
+    // タイムスタンプ生成
+    char isoTime[32];
+    getStartTime(isoTime, sizeof(isoTime));
 
-    bool currentRising = filtered > prevFiltered;
+    // JSON組み立て（512バイトに拡張）
+    StaticJsonDocument<512> doc;
 
-    if (rising && !currentRising && prevFiltered > STEP_THRESHOLD) {
-        unsigned long now = millis();
+    // 自分の児童IDをDBから参照して設定
+    doc["child_id"] = getChildId(DEVICE_ID);
 
-        if (now - lastStepMillis > STEP_INTERVAL) {
-            stepCount++;
-            lastStepMillis = now;
-            Serial.printf("STEP %d\n", stepCount);
-        }
-    }
+    // 歩数情報を格納
+    JsonObject singledata = doc.createNestedObject("singledata");
+    singledata["date"] = isoTime; // タイムスタンプ
+    singledata["steps"] = steps; // 歩数情報
 
-    rising = currentRising;
-    prevFiltered = filtered;
-}
+    portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
-// =========================
-// 距離計算
-// =========================
-float calculateDistance(int rssi) {
-    int txPower = -59;
-
-    if (rssi == 0)
-        return -1;
-
-    float ratio = rssi * 1.0 / txPower;
-
-    if (ratio < 1.0) {
-        return pow(ratio, 10);
-    }
-
-    return 0.89976 * pow(ratio, 7.7095) + 0.111; // 信号強度計算
-}
-
-// =========================
-// ノード更新
-// =========================
-void updateDevice(String id, int rssi) {
-    float distance = calculateDistance(rssi);
-
+    // 相対距離情報を格納（近くにいるデバイス分だけ追加）
+    JsonArray distances = doc.createNestedArray("distances");
     for (int i = 0; i < deviceCount; i++) {
-        if (devices[i].id == id) {
-            devices[i].rssi = rssi;
-            devices[i].distance = distance;
-            devices[i].lastSeen = millis();
+        // 10秒以上検出されていないデバイスは送信しない
+        if (millis() - devices[i].lastSeen > 10000) 
+            continue;
 
-            return;
-        }
+        JsonObject dist = distances.createNestedObject();
+
+        dist["date"] = isoTime; // タイムスタンプ
+        // dist["with_child"] = getChildId(devices[i].id); // 測定した相手のID
+        dist["with_child"] = 2; // テスト用に定数でID=2を設定
+        dist["distance"] = devices[i].distance; // 相対距離情報
     }
 
-    if (deviceCount < 20) {
-        devices[deviceCount].id = id;
-        devices[deviceCount].rssi = rssi;
-        devices[deviceCount].distance = distance;
-        devices[deviceCount].lastSeen = millis();
+    portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
-        deviceCount++;
+    // JSONを文字列へ変換
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    Serial.println("Sending: " + jsonStr);
+
+    // HTTPのPOSTでサーバへデータを送信するようにする
+    HTTPClient http;
+    http.begin(API_URL); // APIサーバのURLを設定
+    http.addHeader("Content-Type", "application/json");
+
+    int httpResponseCode = http.POST(jsonStr);
+
+    if (httpResponseCode > 0) {
+        Serial.println("HTTP Response: " + String(httpResponseCode));
+        String response = http.getString();
+        Serial.println("Response: " + response);
+    } else {
+        Serial.println("Error: " + String(httpResponseCode));
     }
+
+    http.end();
 }
 
-// =========================
-// BLE callback
-// =========================
-class MyCallbacks : public BLEAdvertisedDeviceCallbacks {
-    void onResult(BLEAdvertisedDevice device) {
-        String name = device.getName().c_str();
-
-        if (!name.startsWith("NODE") || name == DEVICE_ID)
-            return;
-
-        int rssi = device.getRSSI();
-        float distance = calculateDistance(rssi);
-
-        portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
-
-        updateDevice(name, rssi);
-
-        latestRSSI = rssi;
-        distanceMeter = distance;
-
-        portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
-
-        Serial.printf("%s RSSI=%d Dist=%.2f\n", name.c_str(), rssi, distance);
-    }
-};
-
-// =========================
-// BLE通信用スレッド
-// =========================
-void bleTask(void *arg) {
-    while (true) {
-        pBLEScan->start(1, false);
-        pBLEScan->clearResults();
-
-        vTaskDelay(200 / portTICK_PERIOD_MS);
-    }
-}
-
-// =========================
 // サーバとの通信用スレッド
-// =========================
 void sendTask(void *arg)
 {
     while (true) {
@@ -580,9 +618,11 @@ void sendTask(void *arg)
     }
 }
 
-// =========================
+// ======================================================
+// UI描画処理
+// ======================================================
+
 // UI初期描画
-// =========================
 void drawUIBase() {
     M5.Display.fillScreen(BLACK);
     M5.Display.setTextColor(WHITE);
@@ -599,9 +639,7 @@ void drawUIBase() {
     M5.Display.printf("STEP:");
 }
 
-// =========================
 // STEP部分のUI更新
-// =========================
 void updateStepUI() {
     static int oldStep = -1;
 
@@ -620,9 +658,7 @@ void updateStepUI() {
     M5.Display.printf("%d", stepCount);
 }
 
-// =========================
 // 相対距離の表示のUI更新
-// =========================
 void updateDistanceUI() {
     const int listX = 20;
     const int listY = 140;
@@ -657,9 +693,7 @@ void updateDistanceUI() {
     portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避    
 }
 
-// =========================
 // Battery部分のUI更新
-// =========================
 void updateBatteryUI() {
     static int oldBattery = -1;
 
@@ -688,18 +722,18 @@ void updateBatteryUI() {
     M5.Display.printf("BAT:%d%%", battery);
 }
 
-// =========================
 // UI描画（部分の更新のみ）
-// =========================
 void drawUI() {
     updateStepUI();
     updateDistanceUI();
     updateBatteryUI();
 }
 
-// =========================
+// ======================================================
 // デバイスのセットアップ
-// =========================
+// ======================================================
+
+// 初期化処理
 void setup() {
     auto cfg = M5.config();
 
@@ -771,76 +805,13 @@ void setup() {
     updateBatteryUI(); // 初回のバッテリー残量を表示
 }
 
-// =========================
-// Wi-Fi経由のデータ送信
-// =========================
-void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot) {
-    // Wi-Fiのコネクションを確認
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("WiFi not connected!");
-        return;
-    }
-
-    // ISOタイムスタンプ生成
-    char isoTime[32];
-    getStartTime(isoTime, sizeof(isoTime));
-
-    // JSON組み立て（512バイトに拡張）
-    StaticJsonDocument<512> doc;
-
-    // 自分の児童IDをDBから参照して設定
-    doc["child_id"] = getChildId(DEVICE_ID);
-
-    // 歩数情報を格納
-    JsonObject singledata = doc.createNestedObject("singledata");
-    singledata["date"] = isoTime; // タイムスタンプ
-    singledata["steps"] = steps; // 歩数情報
-
-    portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
-
-    // 相対距離情報を格納（近くにいるデバイス分だけ追加）
-    JsonArray distances = doc.createNestedArray("distances");
-    for (int i = 0; i < deviceCount; i++) {
-        // 10秒以上検出されていないデバイスは送信しない
-        if (millis() - devices[i].lastSeen > 10000) 
-            continue;
-
-        JsonObject dist = distances.createNestedObject();
-
-        dist["date"] = isoTime; // タイムスタンプ
-        // dist["with_child"] = getChildId(devices[i].id); // 測定した相手のID
-        dist["with_child"] = 2; // テスト用に定数でID=2を設定
-        dist["distance"] = devices[i].distance; // 相対距離情報
-    }
-
-    portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
-
-    // JSONを文字列へ変換
-    String jsonStr;
-    serializeJson(doc, jsonStr);
-    Serial.println("Sending: " + jsonStr);
-
-    // HTTPのPOSTでサーバへデータを送信するようにする
-    HTTPClient http;
-    http.begin(API_URL); // APIサーバのURLを設定
-    http.addHeader("Content-Type", "application/json");
-
-    int httpResponseCode = http.POST(jsonStr);
-
-    if (httpResponseCode > 0) {
-        Serial.println("HTTP Response: " + String(httpResponseCode));
-        String response = http.getString();
-        Serial.println("Response: " + response);
-    } else {
-        Serial.println("Error: " + String(httpResponseCode));
-    }
-
-    http.end();
-}
-
-// =========================
+// ======================================================
 // メインループ
-// =========================
+// ======================================================
+
+unsigned long lastUI = 0; // 画面更新頻度のパラメータ
+
+// メインループ処理
 void loop() {
     updateSensors(); // センサー値を常時取得
     updateStepCount(); // 最新のセンサー値から歩数計算
