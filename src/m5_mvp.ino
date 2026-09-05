@@ -415,7 +415,22 @@ void saveDataToCSV() {
 }
 
 // =========================
-// 歩数計算
+// センサー値を取得して最新値を更新
+// =========================
+void updateSensors() {
+    float ax, ay, az, gx, gy, gz, mx, my, mz;
+
+    M5.Imu.getAccelData(&ax, &ay, &az);
+    M5.Imu.getGyroData(&gx, &gy, &gz);
+    M5.Imu.getMag(&mx, &my, &mz);
+
+    latestAx = ax; latestAy = ay; latestAz = az;
+    latestGx = gx; latestGy = gy; latestGz = gz;
+    latestMx = mx; latestMy = my; latestMz = mz;
+}
+
+// =========================
+// 加速度からの歩数計算
 // =========================
 void updateStepCount() {
     static float gravity = 1.0f;
@@ -423,47 +438,24 @@ void updateStepCount() {
     static float prevFiltered = 0.0f;
     static bool rising = false;
     static unsigned long lastStepMillis = 0;
-    static bool calibrated = false;
+    static int calibrationCount = 0;
 
     const float ALPHA = 0.92f;
     const float STEP_THRESHOLD = 0.18f;
     const unsigned long STEP_INTERVAL = 300;
 
-    if (!calibrated) {
-        for (int i = 0; i < 40; i++) {
-            float ax, ay, az;
+    float accelMagnitude = sqrt(
+        latestAx * latestAx +
+        latestAy * latestAy +
+        latestAz * latestAz
+    );
 
-            M5.Imu.getAccelData(&ax, &ay, &az);
-
-            float accelMagnitude = sqrt(ax * ax + ay * ay + az * az);
-
-            gravity = gravity * 0.9f + accelMagnitude * 0.1f;
-
-            delay(20);
-        }
-
-        calibrated = true;
+    // 起動直後の重力加速度を簡易キャリブレーション
+    if (calibrationCount < 40) {
+        gravity = gravity * 0.9f + accelMagnitude * 0.1f;
+        calibrationCount++;
+        return;
     }
-
-    float ax, ay, az;
-    float gx, gy, gz;
-    float mx, my, mz;
-
-    M5.Imu.getAccelData(&ax, &ay, &az);
-    M5.Imu.getGyroData(&gx, &gy, &gz);
-    M5.Imu.getMag(&mx, &my, &mz);
-
-    latestAx = ax;
-    latestAy = ay;
-    latestAz = az;
-    latestGx = gx;
-    latestGy = gy;
-    latestGz = gz;
-    latestMx = mx;
-    latestMy = my;
-    latestMz = mz;
-
-    float accelMagnitude = sqrt(ax * ax + ay * ay + az * az);
 
     gravity = gravity * ALPHA + accelMagnitude * (1.0f - ALPHA);
     filtered = accelMagnitude - gravity;
@@ -476,7 +468,6 @@ void updateStepCount() {
         if (now - lastStepMillis > STEP_INTERVAL) {
             stepCount++;
             lastStepMillis = now;
-
             Serial.printf("STEP %d\n", stepCount);
         }
     }
@@ -851,11 +842,12 @@ void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot
 // メインループ
 // =========================
 void loop() {
-    updateStepCount(); // 歩数計算
+    updateSensors(); // センサー値を常時取得
+    updateStepCount(); // 最新のセンサー値から歩数計算
 
     unsigned long now = millis();
 
-    // 0.1秒ごとにバッファへ取得・追記
+    // 0.1秒ごとにCSVへ記録
     if (now - lastCSVMillis >= CSV_INTERVAL) {
         saveDataToCSV();
         lastCSVMillis = now;
