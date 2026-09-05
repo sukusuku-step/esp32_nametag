@@ -10,7 +10,7 @@
 #include <time.h>
 #include "cert.h"
 
-#define DEVICE_ID "NODE_B" // 児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
+#define DEVICE_ID "NODE_TARO" // 児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
 
 // ======================================================
 // マルチスレッドの構成
@@ -32,6 +32,23 @@
 //       - HTTP通信
 //
 // ======================================================
+
+// =========================
+// child_idの取得
+// =========================
+int getChildId(const String& deviceName) {
+    // DBから児童の名前に対応したidを照合する
+
+    return 1;
+}
+
+// 指定したID値が現在存在するかどうかを確認する
+bool hasDistanceColumn(int childId) {
+    for (int i = 0; i < distanceColumnCount; i++) {
+        if (distanceChildIds[i] == childId) return true;
+    }
+    return false;
+}
 
 BLEScan* pBLEScan;
 BLEAdvertising* pAdvertising;
@@ -85,13 +102,24 @@ int deviceCount = 0;
 // =========================
 // SD / CSV
 // =========================
-char csvFileName[32] = "";
+#define MAX_DISTANCE_COLUMNS 20
+
+int distanceChildIds[MAX_DISTANCE_COLUMNS];
+int distanceColumnCount = 0;
+
+unsigned long csvSampleCount = 0;
+bool startWritten = false;
+
+char measurementStartTime[32] = ""; // 計測開始時刻
+char csvFileName[48] = "";
+
 unsigned long lastCSVMillis = 0;
 unsigned long lastFlushMillis = 0;
 unsigned long lastSendMillis = 0;
-const unsigned long CSV_INTERVAL = 100;         // データ取得・バッファ追加間隔 [ms]
-const unsigned long CSV_FLUSH_INTERVAL = 1000;  // バッファをSDへ書き込む間隔 [ms]
-const unsigned long SEND_INTERVAL = 10000;      // サーバへの送信間隔 [ms]
+
+const unsigned long CSV_INTERVAL = 100; // データのセンシング周期 [ms]
+const unsigned long CSV_FLUSH_INTERVAL = 1000; // 計測データをSDへ書き込む周期 [ms]
+const unsigned long SEND_INTERVAL = 10000; // 計測データのサーバへの送信周期 [ms]
 
 // SDへの書き込み回数を減らすためのバッファ（固定サイズ、ヒープ確保なし）
 #define CSV_BUFFER_SIZE 8192
@@ -118,7 +146,8 @@ void syncTimeWithNTP() {
 
     struct tm timeinfo;
 
-    if (getLocalTime(&timeinfo, 5000)) { // 最大5秒待つ
+    if (getLocalTime(&timeinfo, 5000)) {
+        // 最大5秒待つ
         Serial.println("NTP time synced");
     } else {
         Serial.println("NTP time sync failed");
@@ -126,38 +155,148 @@ void syncTimeWithNTP() {
 }
 
 // =========================
-// ISO8601形式（UTC）の現在時刻を取得
+// 計測開始時刻を取得
 // =========================
-void getIsoTimeUTC(char* buffer, size_t size) {
+void getStartTime(char* buffer, size_t size) {
     time_t now = time(nullptr);
     struct tm* t = gmtime(&now);
 
-    snprintf(buffer, size, "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
-             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-             t->tm_hour, t->tm_min, t->tm_sec);
+    // 計測開始時刻をUTCのISO8601時刻で取得
+    snprintf(buffer, size, "%04d-%02d-%02d %02d:%02d:%02d",
+            t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+            t->tm_hour, t->tm_min, t->tm_sec);
 }
 
 void createNewCSVFile() {
     time_t now = time(nullptr);
-    struct tm* timeinfo = localtime(&now);
+    struct tm* t = localtime(&now);
 
-    sprintf(csvFileName,
-            "/data_%04d%02d%02d_%02d%02d%02d.csv",
-            timeinfo->tm_year + 1900,
-            timeinfo->tm_mon + 1,
-            timeinfo->tm_mday,
-            timeinfo->tm_hour,
-            timeinfo->tm_min,
-            timeinfo->tm_sec
-        );
+    snprintf(csvFileName, sizeof(csvFileName), "/data_%04d%02d%02d_%02d%02d%02d.csv",
+            t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+            t->tm_hour, t->tm_min, t->tm_sec);
+
+    getStartTime(measurementStartTime, sizeof(measurementStartTime));
+
+    distanceColumnCount = 0;
+    csvSampleCount = 0;
+    startWritten = false;
 
     File file = SD.open(csvFileName, FILE_WRITE);
+    if (!file) {
+        Serial.println("CSV file creation failed.");
+        return;
+    }
 
-    if (file) {
-        file.println("Timestamp,Steps,Ax,Ay,Az,Gx,Gy,Gz,Mx,My,Mz,NodeID,Distance(m)");
-        file.close();
+    file.println("Timestamp,Steps,Ax,Ay,Az,Gx,Gy,Gz,Mx,My,Mz,Start");
+    file.close();
 
-        Serial.printf("New CSV file created: %s\n",csvFileName);
+    Serial.print("CSV created: ");
+    Serial.println(csvFileName);
+    Serial.print("Start: ");
+    Serial.println(measurementStartTime);
+
+    // 最初はDistanceの列を作らない
+}
+
+// Distance列を後から追加する関数
+bool addDistanceColumn(int childId) {
+    if (hasDistanceColumn(childId)) return true;
+    if (distanceColumnCount >= MAX_DISTANCE_COLUMNS) {
+        Serial.println("Maximum distance columns reached.");
+        return false;
+    }
+
+    flushCSVBuffer();
+
+    char tempFileName[64];
+    snprintf(tempFileName, sizeof(tempFileName), "%s.tmp", csvFileName);
+
+    File src = SD.open(csvFileName, FILE_READ);
+    File dst = SD.open(tempFileName, FILE_WRITE);
+
+    if (!src || !dst) {
+        Serial.println("Failed to open CSV for column addition.");
+        if (src) src.close();
+        if (dst) dst.close();
+        return false;
+    }
+
+    char line[512];
+
+    // ヘッダーに新しいDistance列を追加
+    if (src.available()) {
+        size_t len = src.readBytesUntil('\n', line, sizeof(line) - 1);
+        line[len] = '\0';
+
+        while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n')) {
+            line[--len] = '\0';
+        }
+
+        dst.print(line);
+        dst.print(",Distance_");
+        dst.println(childId);
+    }
+
+    // 既存データの末尾に空欄を1つ追加
+    while (src.available()) {
+        size_t len = src.readBytesUntil('\n', line, sizeof(line) - 1);
+        line[len] = '\0';
+
+        while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n')) {
+            line[--len] = '\0';
+        }
+
+        dst.print(line);
+        dst.println(",");
+    }
+
+    src.close();
+    dst.close();
+
+    // 一時ファイルを正式なCSVファイルに置き換える
+    if (!SD.remove(csvFileName)) {
+        Serial.println("Failed to remove old CSV.");
+        SD.remove(tempFileName);
+        return false;
+    }
+
+    if (!SD.rename(tempFileName, csvFileName)) {
+        Serial.println("Failed to rename temporary CSV.");
+        return false;
+    }
+
+    distanceChildIds[distanceColumnCount] = childId;
+    distanceColumnCount++;
+
+    Serial.print("Added Distance_");
+    Serial.println(childId);
+
+    return true;
+}
+
+void updateDistanceColumns() {
+    DeviceInfo snapshot[20];
+    int count;
+
+    // BLEタスクと同時にdevices[]を触らないようコピーする
+    portENTER_CRITICAL(&sharedStateMux);
+    count = deviceCount;
+    if (count > 20) count = 20;
+
+    for (int i = 0; i < count; i++) {
+        snapshot[i] = devices[i];
+    }
+    portEXIT_CRITICAL(&sharedStateMux);
+
+    for (int i = 0; i < count; i++) {
+        // 10秒以上更新されていない機器は現在の測定対象から除外
+        if (millis() - snapshot[i].lastSeen > 10000) continue;
+
+        int childId = getChildId(snapshot[i].id);
+
+        if (childId > 0 && !hasDistanceColumn(childId)) {
+            addDistanceColumn(childId);
+        }
     }
 }
 
@@ -197,43 +336,82 @@ void flushCSVBuffer() {
 // データをCSVバッファへ書き込む
 // 近接する全ノードの名前と距離をそれぞれ1行ずつ追記する
 // =========================
-void saveDataToCSV(int steps, float ax, float ay, float az, float gx, float gy, float gz, float mx, float my, float mz) {
-    if (csvFileName[0] == '\0')
-        return;
+void saveDataToCSV() {
+    updateDistanceColumns();
 
-    char isoTime[32];
-    getIsoTimeUTC(isoTime, sizeof(isoTime));
+    DeviceInfo snapshot[20];
+    int count;
 
-    DeviceInfo nearbyDevices[20];
-    int nearbyCount = 0;
+    portENTER_CRITICAL(&sharedStateMux);
+    count = deviceCount;
+    if (count > 20) count = 20;
 
-    portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+    for (int i = 0; i < count; i++) {
+        snapshot[i] = devices[i];
+    }
+    portEXIT_CRITICAL(&sharedStateMux);
 
-    for (int i = 0; i < deviceCount; i++) {
-        if (millis() - devices[i].lastSeen > 10000) // 10秒以上検出されていないデバイスは対象外
-            continue;
+    String row;
+    row.reserve(512);
 
-        nearbyDevices[nearbyCount] = devices[i];
-        nearbyCount++;
+    // Timestampは0.0, 0.1, 0.2...とサンプル番号から生成する
+    float timestamp = csvSampleCount * 0.1f;
+
+    row += String(timestamp, 1);
+    row += ",";
+    row += String(stepCount);
+    row += ",";
+    row += String(latestAx, 4);
+    row += ",";
+    row += String(latestAy, 4);
+    row += ",";
+    row += String(latestAz, 4);
+    row += ",";
+    row += String(latestGx, 4);
+    row += ",";
+    row += String(latestGy, 4);
+    row += ",";
+    row += String(latestGz, 4);
+    row += ",";
+    row += String(latestMx, 4);
+    row += ",";
+    row += String(latestMy, 4);
+    row += ",";
+    row += String(latestMz, 4);
+    row += ",";
+
+    // Startは最初の1行だけに書く
+    if (!startWritten) {
+        row += measurementStartTime;
+        startWritten = true;
     }
 
-    portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+    // 登録済みのDistance列をすべて出力
+    for (int c = 0; c < distanceColumnCount; c++) {
+        row += ",";
 
-    char line[200];
+        bool found = false;
 
-    if (nearbyCount == 0) {
-        // 近接ノードがいない場合も歩数・9軸データだけは記録する
-        snprintf(line, sizeof(line), "%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,,\n",
-                 isoTime, steps, ax, ay, az, gx, gy, gz, mx, my, mz);
-        appendToCSVBuffer(line);
-    } else {
-        for (int i = 0; i < nearbyCount; i++) {
-            snprintf(line, sizeof(line), "%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%.2f\n",
-                     isoTime, steps, ax, ay, az, gx, gy, gz, mx, my, mz,
-                     nearbyDevices[i].id.c_str(), nearbyDevices[i].distance);
-            appendToCSVBuffer(line);
+        for (int i = 0; i < count; i++) {
+            if (millis() - snapshot[i].lastSeen > 10000) continue;
+
+            int childId = getChildId(snapshot[i].id);
+
+            if (childId == distanceChildIds[c]) {
+                row += String(snapshot[i].distance, 2);
+                found = true;
+                break;
+            }
         }
+
+        // found == false の場合は空欄のまま
     }
+
+    row += "\n";
+
+    appendToCSVBuffer(row.c_str());
+
+    csvSampleCount++;
 }
 
 // =========================
@@ -409,15 +587,6 @@ void sendTask(void *arg)
 
         vTaskDelay(100 / portTICK_PERIOD_MS);
     }
-}
-
-// =========================
-// child_idの取得
-// =========================
-int getChildId(const String& deviceName) {
-    // DBから児童の名前に対応したidを照合する
-
-    return 1;
 }
 
 // =========================
@@ -605,6 +774,7 @@ void setup() {
     }
 
     createNewCSVFile(); // 同期できていればその時刻でファイル名を生成する
+    lastCSVMillis = millis();
 
     drawUIBase(); // UIの初期描画
     updateBatteryUI(); // 初回のバッテリー残量を表示
@@ -622,7 +792,7 @@ void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot
 
     // ISOタイムスタンプ生成
     char isoTime[32];
-    getIsoTimeUTC(isoTime, sizeof(isoTime));
+    getStartTime(isoTime, sizeof(isoTime));
 
     // JSON組み立て（512バイトに拡張）
     StaticJsonDocument<512> doc;
@@ -685,8 +855,9 @@ void loop() {
 
     unsigned long now = millis();
 
-    if (now - lastCSVMillis > CSV_INTERVAL) { // 0.1秒ごとにバッファへ取得・追記
-        saveDataToCSV(stepCount, latestAx, latestAy, latestAz, latestGx, latestGy, latestGz, latestMx, latestMy, latestMz);
+    // 0.1秒ごとにバッファへ取得・追記
+    if (now - lastCSVMillis >= CSV_INTERVAL) {
+        saveDataToCSV();
         lastCSVMillis = now;
     }
 
