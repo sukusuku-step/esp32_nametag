@@ -36,8 +36,11 @@
 // ======================================================
 
 #define DEVICE_ID "NODE_TARO" // 対応する児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
+
 #define CSV_BUFFER_SIZE 8192 // CSVバッファのサイズ
 #define MAX_DISTANCE_COLUMNS 30 // CSVバッファのDistanceカラムの最大値
+#define DEVICE_TIMEOUT_MS 10000 // 相対距離測定の際の相手デバイスのタイムアウト時間
+#define UI_UPDATE_MS 10000 // 画面更新頻度
 
 // 累計歩数のカウント
 volatile int stepCount = 0;
@@ -64,7 +67,7 @@ unsigned long lastCSVMillis = 0;
 unsigned long lastFlushMillis = 0;
 unsigned long lastSendMillis = 0;
 
-// センシング自体はメインループのクロック周期に依存する
+// センシング自体の周期はメインループのクロック周期に依存する
 
 const unsigned long CSV_INTERVAL = 100; // CSVバッファへの記録周期 [ms]
 const unsigned long CSV_FLUSH_INTERVAL = 1000; // 計測データをSDへ書き込む周期 [ms]
@@ -252,10 +255,11 @@ void updateStepCount() {
 }
 
 // ======================================================
-// CSVバッファの作成・SDカードへの保存
+// CSVデータの作成・SDカードへの保存
 // ======================================================
 
-// SDへの書き込み回数を減らすためのCSVバッファ（固定サイズ、ヒープ確保なし）
+// CSV形式の文字列を格納する変数（固定サイズ、ヒープ確保なし）
+// SDカードへの書き込み回数を減らすためのバッファとなる
 char csvBuffer[CSV_BUFFER_SIZE];
 size_t csvBufferLen = 0;
 
@@ -294,7 +298,7 @@ void getStartTime(char* buffer, size_t size) {
             t->tm_hour, t->tm_min, t->tm_sec);
 }
 
-// CSVバッファを作成する関数
+// CSVバッファを初期化する関数（最初に一度呼ばれる）
 void createNewCSVFile() {
     time_t now = time(nullptr);
     struct tm* t = localtime(&now);
@@ -303,6 +307,7 @@ void createNewCSVFile() {
             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
             t->tm_hour, t->tm_min, t->tm_sec);
 
+    // 計測開始時刻を取得する
     getStartTime(measurementStartTime, sizeof(measurementStartTime));
 
     distanceColumnCount = 0;
@@ -315,6 +320,7 @@ void createNewCSVFile() {
         return;
     }
 
+    // 最初に各カラムを用意しておく
     file.println("Timestamp,Steps,Ax,Ay,Az,Gx,Gy,Gz,Mx,My,Mz,Start");
     file.close();
 
@@ -323,10 +329,10 @@ void createNewCSVFile() {
     Serial.print("Start: ");
     Serial.println(measurementStartTime);
 
-    // 最初はDistanceの列を作らないようにする
+    // 最初は相対距離用のカラムを作らない
 }
 
-// CSVバッファへ1行追記する（バッファが満杯なら先にフラッシュ）
+// 引数の新たな行をCSVバッファへ追記する関数
 void appendToCSVBuffer(const char* line) {
     size_t lineLen = strlen(line);
 
@@ -337,27 +343,22 @@ void appendToCSVBuffer(const char* line) {
     csvBufferLen += lineLen;
 }
 
-// CSVバッファをSDへまとめて書き込む（一定間隔でまとめて書き込む）
-void flushCSVBuffer() {
-    if (csvFileName[0] == '\0' || csvBufferLen == 0)
-        return;
-
-    File file = SD.open(csvFileName, FILE_APPEND);
-
-    if (file) {
-        file.write((const uint8_t*)csvBuffer, csvBufferLen);
-        file.close();
-    }
-
-    csvBufferLen = 0;
-}
-
-// Distance列を後から追加する関数（検出されたデバイス数に合わせる）
+// Distance列を後から追加する関数（検出されたデバイス数に対応）
+// 引数に渡したID値の児童用の相対距離のカラムを新しくCSVに追加する
 bool addDistanceColumn(int childId) {
+    // 既にその児童用の相対距離のカラムがある場合
     if (hasDistanceColumn(childId)) return true;
+
+    // 作成するDistance列の数が上限に達している場合
     if (distanceColumnCount >= MAX_DISTANCE_COLUMNS) return false;
 
-    flushCSVBuffer();
+    flushCSVBuffer(); // 一度SDカードにはこの時点のCSVバッファを書き込んでおく
+
+    // ======================================================
+    // 一度tmpを作ってそこに新たに必要となったDistance列を追加
+    // 作成したtmpを元のCSVバッファに置き換えるという実装
+    // 既にあるDistance列は削除しないで全て残しておく
+    // ======================================================
 
     char tempFileName[64];
     snprintf(tempFileName, sizeof(tempFileName), "%s.tmp", csvFileName);
@@ -373,7 +374,7 @@ bool addDistanceColumn(int childId) {
 
     char line[512];
 
-    // ヘッダーに新しいDistance列を追加
+    // ヘッダーに新しいDistance列を追加する
     if (src.available()) {
         size_t len = src.readBytesUntil('\n', line, sizeof(line) - 1);
         line[len] = '\0';
@@ -387,7 +388,7 @@ bool addDistanceColumn(int childId) {
         dst.println(childId);
     }
 
-    // 既存データの末尾に空欄を1つ追加
+    // 既存データの末尾に空欄を1つ追加（改行文字を取り除く）
     while (src.available()) {
         size_t len = src.readBytesUntil('\n', line, sizeof(line) - 1);
         line[len] = '\0';
@@ -403,7 +404,7 @@ bool addDistanceColumn(int childId) {
     src.close();
     dst.close();
 
-    // 一時ファイルを正式なCSVファイルに置き換える
+    // tmpを元のCSVバッファと置き換える（元のCSVバッファは削除）
     if (!SD.remove(csvFileName)) {
         Serial.println("Failed to remove old CSV.");
         SD.remove(tempFileName);
@@ -424,35 +425,41 @@ bool addDistanceColumn(int childId) {
     return true;
 }
 
+// 新たに検出された児童がいるかどうかを確認する関数
 void updateDistanceColumns() {
     DeviceInfo snapshot[20];
     int count;
 
-    // BLEタスクと同時にdevices[]を触らないようコピーする
-    portENTER_CRITICAL(&sharedStateMux);
+    portENTER_CRITICAL(&sharedStateMux);  // devices[]への同時アクセス回避
     count = deviceCount;
     if (count > 20) count = 20;
 
     for (int i = 0; i < count; i++) {
         snapshot[i] = devices[i];
     }
-    portEXIT_CRITICAL(&sharedStateMux);
+    portEXIT_CRITICAL(&sharedStateMux);  // devices[]への同時アクセス回避
 
     for (int i = 0; i < count; i++) {
-        // 10秒以上更新されていない機器は現在の測定対象から除外
-        if (millis() - snapshot[i].lastSeen > 10000) continue;
+        // タイムアウトしたデバイスは現在の相対距離の測定対象から除外
+        if (millis() - snapshot[i].lastSeen > DEVICE_TIMEOUT_MS) continue;
 
         int childId = getChildId(snapshot[i].id);
 
+        // 新たに検出された児童がいる場合
         if (childId > 0 && !hasDistanceColumn(childId)) {
-            addDistanceColumn(childId);
+            addDistanceColumn(childId); // 新たなDistance列を追加する
         }
     }
 }
 
-// 計測データをCSVバッファへ書き込む関数
+// 現時点での計測データからCSVバッファを更新する関数
 void saveDataToCSV() {
-    updateDistanceColumns();
+    updateDistanceColumns(); // 現状の相対距離測定の相手デバイスを確認する
+
+    // ======================================================
+    // この時点で必要な分のCSVのカラムは用意は完了済み
+    // 元々あったDistance列はタイムアウトしていても残されている
+    // ======================================================
 
     DeviceInfo snapshot[20];
     int count;
@@ -495,7 +502,7 @@ void saveDataToCSV() {
     row += String(latestMz, 4);
     row += ",";
 
-    // Startは最初の1行だけに書く
+    // Start（計測開始時刻）のカラムは最初の1行目だけに書く
     if (!startWritten) {
         row += measurementStartTime;
         startWritten = true;
@@ -508,7 +515,7 @@ void saveDataToCSV() {
         bool found = false;
 
         for (int i = 0; i < count; i++) {
-            if (millis() - snapshot[i].lastSeen > 10000) continue;
+            if (millis() - snapshot[i].lastSeen > DEVICE_TIMEOUT_MS) continue;
 
             int childId = getChildId(snapshot[i].id);
 
@@ -524,9 +531,23 @@ void saveDataToCSV() {
 
     row += "\n";
 
-    appendToCSVBuffer(row.c_str());
+    appendToCSVBuffer(row.c_str()); // 新たに作った行を元のCSVバッファへ追記
 
     csvSampleCount++;
+}
+
+// 現時点でのCSVバッファをSDカードへ書き込む関数（一定間隔でまとめて書き込む）
+void flushCSVBuffer() {
+    if (csvFileName[0] == '\0' || csvBufferLen == 0) return;
+
+    File file = SD.open(csvFileName, FILE_APPEND);
+
+    if (file) {
+        file.write((const uint8_t*)csvBuffer, csvBufferLen);
+        file.close();
+    }
+
+    csvBufferLen = 0; // 書き込んだ後は長さを0に戻す
 }
 
 // ======================================================
@@ -813,23 +834,25 @@ unsigned long lastUI = 0; // 画面更新頻度のパラメータ
 
 // メインループ処理
 void loop() {
-    updateSensors(); // センサー値を常時取得
-    updateStepCount(); // 最新のセンサー値から歩数計算
+    updateSensors(); // センシングした値を更新
+    updateStepCount(); // 最新のセンシング値から歩数を計算して更新
 
     unsigned long now = millis();
 
-    // 0.1秒ごとにCSVへ記録
+    // 一定時間周期でCSVバッファを更新
     if (now - lastCSVMillis >= CSV_INTERVAL) {
         saveDataToCSV();
         lastCSVMillis = now;
     }
 
-    if (now - lastFlushMillis > CSV_FLUSH_INTERVAL) { // 1秒ごとにまとめてSDへ書き込む
+    // 一定時間周期でまとめて計測データをSDカードへ書き込む
+    if (now - lastFlushMillis > CSV_FLUSH_INTERVAL) {
         flushCSVBuffer();
         lastFlushMillis = now;
     }
 
-    if (now - lastSendMillis > SEND_INTERVAL) { // 10秒ごとにサーバへ送信
+    // 一定時間周期で計測データをサーバへ送信
+    if (now - lastSendMillis > SEND_INTERVAL) {
         portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
         sendData.timestamp = now / 1000;
@@ -842,7 +865,8 @@ void loop() {
         lastSendMillis = now;
     }
 
-    if (now - lastUI > 10000) { //10秒ごとの更新
+    // 一定時間周期で画面更新
+    if (now - lastUI > UI_UPDATE_MS) { 
         drawUI(); // 必要な部分だけ数値の表示を更新する
         lastUI = now;
     }
