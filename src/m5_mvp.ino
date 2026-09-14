@@ -290,7 +290,7 @@ void syncTimeWithNTP() {
 // 計測開始時刻を取得する関数
 void getStartTime(char* buffer, size_t size) {
     time_t now = time(nullptr);
-    struct tm* t = gmtime(&now);
+    struct tm* t = localtime(&now);
 
     // 計測開始時刻をUTCのISO8601時刻で取得
     snprintf(buffer, size, "%04d-%02d-%02d %02d:%02d:%02d",
