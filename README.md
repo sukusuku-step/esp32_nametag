@@ -85,7 +85,7 @@ Timestamp,Steps,Ax,Ay,Az,Gx,Gy,Gz,Mx,My,Mz,Start,Distance_1,Distance_2,...
 |Mx|X軸地磁気|センサ値|
 |My|Y軸地磁気|センサ値|
 |Mz|Z軸地磁気|センサ値|
-|Start|計測開始時刻|UTCのISO8601時刻|
+|Start|計測開始時刻|JST時刻|
 |Distance_N|ID=Nの相手デバイスとの相対距離|メートル|
 
 - Timestampは0.0、0.1、0.2...を必ず記録
