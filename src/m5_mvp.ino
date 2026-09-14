@@ -669,8 +669,8 @@ void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot
     // 相対距離情報を格納（近くにいるデバイス分だけ追加）
     JsonArray distances = doc.createNestedArray("distances");
     for (int i = 0; i < deviceCount; i++) {
-        // 10秒以上検出されていないデバイスは送信しない
-        if (millis() - devices[i].lastSeen > 10000) 
+        // タイムアウトしたデバイスのデータは送信しない
+        if (millis() - devices[i].lastSeen > DEVICE_TIMEOUT_MS) 
             continue;
 
         JsonObject dist = distances.createNestedObject();
