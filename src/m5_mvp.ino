@@ -363,12 +363,16 @@ bool addDistanceColumn(int childId) {
     char tempFileName[64];
     snprintf(tempFileName, sizeof(tempFileName), "%s.tmp", csvFileName);
 
+    // 前回のtmpファイルが残っていたら削除する
+    if (SD.exists(tempFileName)) SD.remove(tempFileName);
+
     File src = SD.open(csvFileName, FILE_READ);
     File dst = SD.open(tempFileName, FILE_WRITE);
 
     if (!src || !dst) {
         if (src) src.close();
         if (dst) dst.close();
+        Serial.println("Failed to remove temporary CSV.");
         return false;
     }
 
@@ -379,9 +383,8 @@ bool addDistanceColumn(int childId) {
         size_t len = src.readBytesUntil('\n', line, sizeof(line) - 1);
         line[len] = '\0';
 
-        while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n')) {
+        while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n'))
             line[--len] = '\0';
-        }
 
         dst.print(line);
         dst.print(",Distance_");
@@ -393,9 +396,8 @@ bool addDistanceColumn(int childId) {
         size_t len = src.readBytesUntil('\n', line, sizeof(line) - 1);
         line[len] = '\0';
 
-        while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n')) {
+        while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n'))
             line[--len] = '\0';
-        }
 
         dst.print(line);
         dst.println(",");
@@ -411,11 +413,13 @@ bool addDistanceColumn(int childId) {
         return false;
     }
 
+    // tmpをリネームしておく
     if (!SD.rename(tempFileName, csvFileName)) {
         Serial.println("Failed to rename temporary CSV.");
         return false;
     }
 
+    // Distance列を登録
     distanceChildIds[distanceColumnCount] = childId;
     distanceColumnCount++;
 
@@ -434,9 +438,9 @@ void updateDistanceColumns() {
     count = deviceCount;
     if (count > 20) count = 20;
 
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < count; i++)
         snapshot[i] = devices[i];
-    }
+
     portEXIT_CRITICAL(&sharedStateMux);  // devices[]への同時アクセス回避
 
     for (int i = 0; i < count; i++) {
@@ -445,9 +449,14 @@ void updateDistanceColumns() {
 
         int childId = getChildId(snapshot[i].id);
 
-        // 新たに検出された児童がいる場合
+        // 新たに検出されたデバイス（児童）がいる場合
         if (childId > 0 && !hasDistanceColumn(childId)) {
-            addDistanceColumn(childId); // 新たなDistance列を追加する
+            // 新たなDistance列を追加する
+            if (!addDistanceColumn(childId)) {
+                Serial.print("Distance_");
+                Serial.print(childId);
+                Serial.println(" の追加に失敗しました。");
+            }
         }
     }
 }
