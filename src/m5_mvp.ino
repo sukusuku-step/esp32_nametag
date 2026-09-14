@@ -676,8 +676,7 @@ void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot
         JsonObject dist = distances.createNestedObject();
 
         dist["date"] = isoTime; // タイムスタンプ
-        // dist["with_child"] = getChildId(devices[i].id); // 測定した相手のID
-        dist["with_child"] = 2; // テスト用に定数でID=2を設定
+        dist["with_child"] = getChildId(devices[i].id); // 測定した相手のID
         dist["distance"] = devices[i].distance; // 相対距離情報
     }
 
