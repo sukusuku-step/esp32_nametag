@@ -35,7 +35,9 @@
 // グローバル変数・マクロ変数の設定
 // ======================================================
 
-#define DEVICE_ID "NODE_TARO" // 対応する児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
+// 対応する児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
+// 名前の重複が無いように基本的にフルネームで登録することとする
+#define DEVICE_ID "NODE_TANAKATARO"
 
 #define CSV_BUFFER_SIZE 8192 // CSVバッファのサイズ
 #define MAX_DISTANCE_COLUMNS 30 // CSVバッファのDistanceカラムの最大値
@@ -77,11 +79,87 @@ const unsigned long SEND_INTERVAL = 10000; // 計測データのサーバへの�
 // 児童ID・BLEデバイス管理
 // ======================================================
 
-// 児童名から対応するchild_idを取得する関数
+// 児童名から対応するID値をDB検索して取得する関数
+// デバイスに登録される児童名は重複が起きない想定で実装
 int getChildId(const String& deviceName) {
-    // DBから児童の名前に対応したidを照合する
+    // NODE_のプレフィックスを除いて児童名（name）を取得
+    String name = deviceName;
+    if (name.startsWith("NODE_"))
+        name = name.substring(5);
 
-    return 1;
+    // Wi-Fi接続が無かった場合
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi not connected. Cannot get child_id.");
+        return -1;
+    }
+
+    // IDを取得するAPIのURLを作成する
+    String url = API_URL;
+    int pathPos = url.indexOf('/', 8);  // https:// の後の最初の /
+
+    if (pathPos >= 0)
+        url = url.substring(0, pathPos);
+
+    url += "/api/children/search?name=" + name;
+
+    Serial.println("Child ID search:");
+    Serial.println("  name = " + name);
+    Serial.println("  URL  = " + url);
+
+    HTTPClient http;
+
+    if (!http.begin(url)) {
+        Serial.println("HTTP begin failed.");
+        return -1;
+    }
+
+    http.addHeader("Accept", "application/json");
+
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode <= 0) {
+        Serial.print("HTTP GET error: ");
+        Serial.println(httpResponseCode);
+        http.end();
+        return -1;
+    }
+
+    Serial.print("HTTP Response: ");
+    Serial.println(httpResponseCode);
+
+    String response = http.getString();
+    Serial.println("Response: " + response);
+
+    http.end();
+
+    if (httpResponseCode != 200) {
+        Serial.println("Child search failed.");
+        return -1;
+    }
+
+    // JSONを解析する
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, response);
+
+    if (error) {
+        Serial.print("JSON parse error: ");
+        Serial.println(error.c_str());
+        return -1;
+    }
+
+    // ID値を取得
+    if (!doc.containsKey("child_id")) {
+        // DBに対応するID値が見つからなかった場合
+        Serial.println("child_id not found in response.");
+        return -1;
+    }
+
+    int childId = doc["child_id"];
+
+    Serial.print("Found child_id: ");
+    Serial.println(childId);
+
+    return childId; // 児童名に対応するID値を返す
 }
 
 // 指定したID値が現在存在しているかどうかを確認する関数
