@@ -89,8 +89,8 @@ int getChildId(const String& deviceName) {
 
     // Wi-Fi接続が無かった場合
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("WiFi not connected. Cannot get child_id.");
-        return -1;
+        Serial.println("WiFi not connected.");
+        return 1; // Wi-Fi接続が無い場合は便宜上 ID=1 を返す
     }
 
     // IDを取得するAPIのURLを作成する
