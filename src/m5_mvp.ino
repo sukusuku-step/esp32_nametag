@@ -68,12 +68,18 @@ char csvFileName[48] = "";
 unsigned long lastCSVMillis = 0;
 unsigned long lastFlushMillis = 0;
 unsigned long lastSendMillis = 0;
+// Wi-Fi断時に毎ループで再接続し、CPU負荷やログ出力が増えることを防ぐ
+unsigned long lastWiFiReconnectMillis = 0;
+// SD.begin() が失敗した場合、未マウントのままSD APIを呼ばないための状態
+bool sdCardMounted = false;
 
 // センシング自体の周期はメインループのクロック周期に依存する
 
 const unsigned long CSV_INTERVAL = 100; // CSVバッファへの記録周期 [ms]
 const unsigned long CSV_FLUSH_INTERVAL = 1000; // 計測データをSDへ書き込む周期 [ms]
 const unsigned long SEND_INTERVAL = 10000; // 計測データのサーバへの送信周期 [ms]
+// Wi-Fi切断中の再接続試行間隔。画面・センシング処理を阻害しないよう間隔を空ける
+const unsigned long WIFI_RECONNECT_INTERVAL = 5000;
 
 // ======================================================
 // 児童ID・BLEデバイス管理
@@ -87,10 +93,10 @@ int getChildId(const String& deviceName) {
     if (name.startsWith("NODE_"))
         name = name.substring(5);
 
-    // Wi-Fi接続が無かった場合
+    // 切断中に便宜上のIDを返すと、別の児童のデータとして誤送信されるため検索失敗扱いにする
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi not connected.");
-        return 1; // Wi-Fi接続が無い場合は便宜上 ID=1 を返す
+        return -1;
     }
 
     // IDを取得するAPIのURLを作成する
@@ -204,6 +210,7 @@ SendData sendData;
 // 複数ノードの管理
 struct DeviceInfo {
     String id;
+    int childId;
     int rssi;
     float distance;
     unsigned long lastSeen;
@@ -228,6 +235,7 @@ void updateDevice(String id, int rssi) {
 
     if (deviceCount < 20) {
         devices[deviceCount].id = id;
+        devices[deviceCount].childId = -1;
         devices[deviceCount].rssi = rssi;
         devices[deviceCount].distance = distance;
         devices[deviceCount].lastSeen = millis();
@@ -343,7 +351,9 @@ size_t csvBufferLen = 0;
 
 // SDカードの初期化
 void initSDCard() {
-    if (!SD.begin(4)) {
+    // 初期化結果を保持し、以降のCSV処理で未マウントのSD API呼び出しを防ぐ
+    sdCardMounted = SD.begin(4);
+    if (!sdCardMounted) {
         Serial.println("SD card initialization failed");
         return;
     }
@@ -378,6 +388,9 @@ void getStartTime(char* buffer, size_t size) {
 
 // CSVバッファを初期化する関数（最初に一度呼ばれる）
 void createNewCSVFile() {
+    // SD未装着・初期化失敗時は計測とネットワーク送信を継続し、CSV処理だけ停止する
+    if (!sdCardMounted) return;
+
     time_t now = time(nullptr);
     struct tm* t = localtime(&now);
 
@@ -424,6 +437,9 @@ void appendToCSVBuffer(const char* line) {
 // Distance列を後から追加する関数（検出されたデバイス数に対応）
 // 引数に渡したID値の児童用の相対距離のカラムを新しくCSVに追加する
 bool addDistanceColumn(int childId) {
+    // 未マウントのSDに対するexists/openの連続失敗を防ぐ
+    if (!sdCardMounted) return false;
+
     // 既にその児童用の相対距離のカラムがある場合
     if (hasDistanceColumn(childId)) return true;
 
@@ -509,6 +525,9 @@ bool addDistanceColumn(int childId) {
 
 // 新たに検出された児童がいるかどうかを確認する関数
 void updateDistanceColumns() {
+    // Distance列の追加はファイル更新を伴うため、SDが利用できる場合だけ実行する
+    if (!sdCardMounted) return;
+
     DeviceInfo snapshot[20];
     int count;
 
@@ -525,7 +544,7 @@ void updateDistanceColumns() {
         // タイムアウトしたデバイスは現在の相対距離の測定対象から除外
         if (millis() - snapshot[i].lastSeen > DEVICE_TIMEOUT_MS) continue;
 
-        int childId = getChildId(snapshot[i].id);
+        int childId = snapshot[i].childId;
 
         // 新たに検出されたデバイス（児童）がいる場合
         if (childId > 0 && !hasDistanceColumn(childId)) {
@@ -541,6 +560,9 @@ void updateDistanceColumns() {
 
 // 現時点での計測データからCSVバッファを更新する関数
 void saveDataToCSV() {
+    // SD障害は画面・BLE・サーバ送信を停止させない
+    if (!sdCardMounted) return;
+
     updateDistanceColumns(); // 現状の相対距離測定の相手デバイスを確認する
 
     // ======================================================
@@ -604,7 +626,7 @@ void saveDataToCSV() {
         for (int i = 0; i < count; i++) {
             if (millis() - snapshot[i].lastSeen > DEVICE_TIMEOUT_MS) continue;
 
-            int childId = getChildId(snapshot[i].id);
+            int childId = snapshot[i].childId;
 
             if (childId == distanceChildIds[c]) {
                 row += String(snapshot[i].distance, 2);
@@ -625,7 +647,8 @@ void saveDataToCSV() {
 
 // 現時点でのCSVバッファをSDカードへ書き込む関数（一定間隔でまとめて書き込む）
 void flushCSVBuffer() {
-    if (csvFileName[0] == '\0' || csvBufferLen == 0) return;
+    // SD未マウント時のopen失敗とエラーログの連続出力を防ぐ
+    if (!sdCardMounted || csvFileName[0] == '\0' || csvBufferLen == 0) return;
 
     File file = SD.open(csvFileName, FILE_APPEND);
 
@@ -642,6 +665,46 @@ void flushCSVBuffer() {
 // ======================================================
 
 // Wi-Fi経由のデータ送信を行う関数
+void reconnectWiFiIfNeeded() {
+    if (WiFi.status() == WL_CONNECTED) return;
+
+    unsigned long now = millis();
+    if (now - lastWiFiReconnectMillis < WIFI_RECONNECT_INTERVAL) return;
+
+    lastWiFiReconnectMillis = now;
+    Serial.println("WiFi reconnecting...");
+    // 再接続は通信タスクで行い、loop()の画面更新をブロックしない
+    WiFi.reconnect();
+}
+
+void resolveDeviceChildIds() {
+    DeviceInfo snapshot[20];
+    int count;
+
+    portENTER_CRITICAL(&sharedStateMux);
+    count = min(deviceCount, 20);
+    for (int i = 0; i < count; i++) snapshot[i] = devices[i];
+    portEXIT_CRITICAL(&sharedStateMux);
+
+    for (int i = 0; i < count; i++) {
+        if (snapshot[i].childId > 0 || millis() - snapshot[i].lastSeen > DEVICE_TIMEOUT_MS)
+            continue;
+
+        // HTTP検索は通信タスクで実行し、CSV/UI更新周期にネットワーク待ちを持ち込まない
+        int childId = getChildId(snapshot[i].id);
+        if (childId <= 0) continue;
+
+        portENTER_CRITICAL(&sharedStateMux);
+        for (int j = 0; j < deviceCount; j++) {
+            if (devices[j].id == snapshot[i].id) {
+                devices[j].childId = childId;
+                break;
+            }
+        }
+        portEXIT_CRITICAL(&sharedStateMux);
+    }
+}
+
 void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot) {
     // Wi-Fiのコネクションを確認
     if (WiFi.status() != WL_CONNECTED) {
@@ -657,30 +720,43 @@ void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot
     StaticJsonDocument<512> doc;
 
     // 自分の児童IDをDBから参照して設定
-    doc["child_id"] = getChildId(DEVICE_ID);
+    int ownChildId = getChildId(DEVICE_ID);
+    if (ownChildId <= 0) return;
+    doc["child_id"] = ownChildId;
 
     // 歩数情報を格納
     JsonObject singledata = doc.createNestedObject("singledata");
     singledata["date"] = isoTime; // タイムスタンプ
     singledata["steps"] = steps; // 歩数情報
 
+    // 共有配列は短時間でコピーし、HTTP通信中にクリティカルセクションを保持しない
+    DeviceInfo snapshot[20];
+    int count;
     portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+    count = min(deviceCount, 20);
+    for (int i = 0; i < count; i++) snapshot[i] = devices[i];
+    portEXIT_CRITICAL(&sharedStateMux);
 
     // 相対距離情報を格納（近くにいるデバイス分だけ追加）
     JsonArray distances = doc.createNestedArray("distances");
-    for (int i = 0; i < deviceCount; i++) {
+    for (int i = 0; i < count; i++) {
         // タイムアウトしたデバイスのデータは送信しない
-        if (millis() - devices[i].lastSeen > DEVICE_TIMEOUT_MS) 
+        if (millis() - snapshot[i].lastSeen > DEVICE_TIMEOUT_MS || snapshot[i].childId <= 0)
             continue;
+
+        // 自身と同じ児童IDへの距離はサーバの自己参照制約に抵触するため送信しない。
+        // BLE名が異なってもDB検索結果が同じIDになる場合がある。
+        if (snapshot[i].childId == ownChildId) {
+            Serial.printf("Skipping self distance: %s (child_id=%d)\n", snapshot[i].id.c_str(), ownChildId);
+            continue;
+        }
 
         JsonObject dist = distances.createNestedObject();
 
         dist["date"] = isoTime; // タイムスタンプ
-        dist["with_child"] = getChildId(devices[i].id); // 測定した相手のID
-        dist["distance"] = devices[i].distance; // 相対距離情報
+        dist["with_child"] = snapshot[i].childId; // 測定した相手のID
+        dist["distance"] = snapshot[i].distance; // 相対距離情報
     }
-
-    portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
     // JSONを文字列へ変換
     String jsonStr;
@@ -709,6 +785,8 @@ void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot
 void sendTask(void *arg)
 {
     while (true) {
+        reconnectWiFiIfNeeded();
+
         if (sendFlag) {
             portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
@@ -717,6 +795,9 @@ void sendTask(void *arg)
             sendFlag = false;
 
             portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
+
+            if (WiFi.status() == WL_CONNECTED)
+                resolveDeviceChildIds();
 
             sendDataToServer(data.timestamp, data.steps, data.distance);
         }
