@@ -390,7 +390,7 @@ void getStartTime(char* buffer, size_t size) {
     time_t now = time(nullptr);
     struct tm* t = localtime(&now);
 
-    // 計測開始時刻をUTCのISO8601時刻で取得
+    // configTime()で設定したタイムゾーン（JST）の計測開始時刻を取得
     snprintf(buffer, size, "%04d-%02d-%02d %02d:%02d:%02d",
             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
             t->tm_hour, t->tm_min, t->tm_sec);
@@ -449,24 +449,53 @@ void appendToCSVBuffer(const char* line) {
 void appendToSendBuffer(const char* line) {
     size_t lineLen = strlen(line);
 
-    if (csvSendBufferLen + lineLen >= CSV_BUFFER_SIZE)
+    if (csvSendBufferLen + lineLen >= CSV_BUFFER_SIZE) {
+        Serial.println("CSV send buffer is full; dropping a row.");
         return;
+    }
 
     memcpy(csvSendBuffer + csvSendBufferLen, line, lineLen);
     csvSendBufferLen += lineLen;
 }
 
+// 送信バッファ内の既存行にもDistance列の空欄を追加する
+bool appendDistanceColumnToSendBuffer() {
+    size_t rowCount = 0;
+
+    for (size_t i = 0; i < csvSendBufferLen; i++) {
+        if (csvSendBuffer[i] == '\n') rowCount++;
+    }
+
+    if (csvSendBufferLen + rowCount >= CSV_BUFFER_SIZE) return false;
+
+    size_t writePos = csvSendBufferLen + rowCount;
+    for (size_t readPos = csvSendBufferLen; readPos > 0; readPos--) {
+        char value = csvSendBuffer[readPos - 1];
+        csvSendBuffer[--writePos] = value;
+        if (value == '\n') csvSendBuffer[--writePos] = ',';
+    }
+
+    csvSendBufferLen += rowCount;
+    return true;
+}
+
 // Distance列を後から追加する関数（検出されたデバイス数に対応）
 // 引数に渡したID値の児童用の相対距離のカラムを新しくCSVに追加する
 bool addDistanceColumn(int childId) {
-    // 未マウントのSDに対するexists/openの連続失敗を防ぐ
-    if (!sdCardMounted) return false;
-
     // 既にその児童用の相対距離のカラムがある場合
     if (hasDistanceColumn(childId)) return true;
 
     // 作成するDistance列の数が上限に達している場合
     if (distanceColumnCount >= MAX_DISTANCE_COLUMNS) return false;
+
+    // SDが使えない場合も、サーバ送信用の列構成は維持する
+    if (!sdCardMounted) {
+        if (!appendDistanceColumnToSendBuffer()) return false;
+
+        distanceChildIds[distanceColumnCount] = childId;
+        distanceColumnCount++;
+        return true;
+    }
 
     flushCSVBuffer(); // 一度SDカードにはこの時点のCSVバッファを書き込んでおく
 
@@ -534,6 +563,8 @@ bool addDistanceColumn(int childId) {
         Serial.println("Failed to rename temporary CSV.");
         return false;
     }
+
+    if (!appendDistanceColumnToSendBuffer()) return false;
 
     // Distance列を登録
     distanceChildIds[distanceColumnCount] = childId;
@@ -761,9 +792,15 @@ void sendCSVBufferToServer() {
     int ownChildId = getChildId(DEVICE_ID);
     if (ownChildId <= 0) return;
 
-    // push_csvは1行目をヘッダーとして読み飛ばす仕様のため、ヘッダーを付けて送信する
-    static const char CSV_HEADER[] = "Timestamp,Steps,Ax,Ay,Az,Gx,Gy,Gz,Mx,My,Mz,Start\n";
-    size_t headerLen = sizeof(CSV_HEADER) - 1; // 末尾のヌル文字を除く
+    // push_csvは1行目をヘッダーとして読み飛ばす仕様のため、現在の列構成を付けて送信する
+    String csvHeader = "Timestamp,Steps,Ax,Ay,Az,Gx,Gy,Gz,Mx,My,Mz,Start";
+    for (int i = 0; i < distanceColumnCount; i++) {
+        csvHeader += ",Distance_";
+        csvHeader += String(distanceChildIds[i]);
+    }
+    csvHeader += "\n";
+
+    size_t headerLen = csvHeader.length();
     size_t totalLen = headerLen + csvSendBufferLen;
 
     uint8_t* body = (uint8_t*)malloc(totalLen);
@@ -772,7 +809,7 @@ void sendCSVBufferToServer() {
         return;
     }
 
-    memcpy(body, CSV_HEADER, headerLen);
+    memcpy(body, csvHeader.c_str(), headerLen);
     memcpy(body + headerLen, csvSendBuffer, csvSendBufferLen);
 
     String url = getApiBaseUrl();
