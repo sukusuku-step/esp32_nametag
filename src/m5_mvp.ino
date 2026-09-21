@@ -87,6 +87,17 @@ const unsigned long WIFI_RECONNECT_INTERVAL = 5000;
 // 児童ID・BLEデバイス管理
 // ======================================================
 
+// API_URLからスキーム+ホスト部分だけを取り出す関数（末尾のパスは含まない）
+String getApiBaseUrl() {
+    String url = API_URL;
+    int pathPos = url.indexOf('/', 8);  // http(s):// の後の最初の /
+
+    if (pathPos >= 0)
+        url = url.substring(0, pathPos);
+
+    return url;
+}
+
 // 児童名から対応するID値をDB検索して取得する関数
 // デバイスに登録される児童名は重複が起きない想定で実装
 int getChildId(const String& deviceName) {
@@ -102,12 +113,7 @@ int getChildId(const String& deviceName) {
     }
 
     // IDを取得するAPIのURLを作成する
-    String url = API_URL;
-    int pathPos = url.indexOf('/', 8);  // https:// の後の最初の /
-
-    if (pathPos >= 0)
-        url = url.substring(0, pathPos);
-
+    String url = getApiBaseUrl();
     url += "/api/children/search?name=" + name;
 
     Serial.println("Child ID search:");
@@ -200,18 +206,12 @@ TaskHandle_t bleTaskHandle;
 TaskHandle_t sendTaskHandle;
 portMUX_TYPE sharedStateMux = portMUX_INITIALIZER_UNLOCKED;
 
-struct SendData {
-    unsigned long timestamp;
-    int steps;
-    float distance;
-};
-
+// 一定間隔でサーバへCSVを送信するためのトリガー
 volatile bool sendFlag = false;
-SendData sendData;
 
 // 複数ノードの管理
 struct DeviceInfo {
-    String id;
+    char id[32]; // Stringにすると更新時にヒープ確保が走り、クリティカルセクション内でのmallocは危険なためchar配列にする
     int childId;
     int rssi;
     float distance;
@@ -222,11 +222,11 @@ DeviceInfo devices[20];
 int deviceCount = 0;
 
 // ノード更新
-void updateDevice(String id, int rssi) {
+void updateDevice(const char* id, int rssi) {
     float distance = calculateDistance(rssi);
 
     for (int i = 0; i < deviceCount; i++) {
-        if (devices[i].id == id) {
+        if (strcmp(devices[i].id, id) == 0) {
             devices[i].rssi = rssi;
             devices[i].distance = distance;
             devices[i].lastSeen = millis();
@@ -236,7 +236,7 @@ void updateDevice(String id, int rssi) {
     }
 
     if (deviceCount < 20) {
-        devices[deviceCount].id = id;
+        strlcpy(devices[deviceCount].id, id, sizeof(devices[deviceCount].id));
         devices[deviceCount].childId = -1;
         devices[deviceCount].rssi = rssi;
         devices[deviceCount].distance = distance;
@@ -259,7 +259,7 @@ class MyCallbacks : public BLEAdvertisedDeviceCallbacks {
 
         portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
-        updateDevice(name, rssi);
+        updateDevice(name.c_str(), rssi);
 
         latestRSSI = rssi;
         distanceMeter = distance;
@@ -351,6 +351,14 @@ void updateStepCount() {
 char csvBuffer[CSV_BUFFER_SIZE];
 size_t csvBufferLen = 0;
 
+// サーバへpush_csvするまでの間、行を貯めておくバッファ（SD用とは別に独立して管理）
+char csvSendBuffer[CSV_BUFFER_SIZE];
+size_t csvSendBufferLen = 0;
+
+// push_csvは送信したCSVの先頭行のStart列から計測開始時刻を読み取る仕様のため、
+// SD保存用のstartWrittenとは別に、送信バッチの先頭行かどうかを管理する
+bool sendBatchStartWritten = false;
+
 // SDカードの初期化処理
 void initSDCard() {
     // 初期化結果を保持し、以降のCSV処理で未マウントのAPI呼び出しを防ぐ
@@ -434,6 +442,18 @@ void appendToCSVBuffer(const char* line) {
 
     memcpy(csvBuffer + csvBufferLen, line, lineLen);
     csvBufferLen += lineLen;
+}
+
+// 引数の新たな行をサーバ送信用バッファへ追記する関数
+// 送信が間に合わずバッファが満杯の場合は、次の送信まで新しい行を取りこぼす
+void appendToSendBuffer(const char* line) {
+    size_t lineLen = strlen(line);
+
+    if (csvSendBufferLen + lineLen >= CSV_BUFFER_SIZE)
+        return;
+
+    memcpy(csvSendBuffer + csvSendBufferLen, line, lineLen);
+    csvSendBufferLen += lineLen;
 }
 
 // Distance列を後から追加する関数（検出されたデバイス数に対応）
@@ -560,12 +580,9 @@ void updateDistanceColumns() {
     }
 }
 
-// 現時点での計測データからCSVバッファを更新する関数
+// 現時点での計測データからCSVバッファ（SD保存用・サーバ送信用）を更新する関数
 void saveDataToCSV() {
-    // SD障害は画面・BLE・サーバ送信を停止させない
-    if (!sdCardMounted) return;
-
-    updateDistanceColumns(); // 現状の相対距離測定の相手デバイスを確認する
+    updateDistanceColumns(); // 現状の相対距離測定の相手デバイスを確認する（SD未マウント時は列追加のみスキップされる）
 
     // ======================================================
     // この時点で必要な分のCSVのカラムは用意は完了済み
@@ -584,65 +601,81 @@ void saveDataToCSV() {
     }
     portEXIT_CRITICAL(&sharedStateMux);  // devices[]への同時アクセス回避
 
-    String row;
-    row.reserve(512);
+    // Timestamp〜Mzまでの列はSD保存用・サーバ送信用で共通
+    String prefix;
+    prefix.reserve(256);
 
     // Timestampは0.0, 0.1, 0.2...とサンプル番号から生成する
     float timestamp = csvSampleCount * 0.1f;
 
-    row += String(timestamp, 1);
-    row += ",";
-    row += String(stepCount);
-    row += ",";
-    row += String(latestAx, 4);
-    row += ",";
-    row += String(latestAy, 4);
-    row += ",";
-    row += String(latestAz, 4);
-    row += ",";
-    row += String(latestGx, 4);
-    row += ",";
-    row += String(latestGy, 4);
-    row += ",";
-    row += String(latestGz, 4);
-    row += ",";
-    row += String(latestMx, 4);
-    row += ",";
-    row += String(latestMy, 4);
-    row += ",";
-    row += String(latestMz, 4);
-    row += ",";
+    prefix += String(timestamp, 1);
+    prefix += ",";
+    prefix += String(stepCount);
+    prefix += ",";
+    prefix += String(latestAx, 4);
+    prefix += ",";
+    prefix += String(latestAy, 4);
+    prefix += ",";
+    prefix += String(latestAz, 4);
+    prefix += ",";
+    prefix += String(latestGx, 4);
+    prefix += ",";
+    prefix += String(latestGy, 4);
+    prefix += ",";
+    prefix += String(latestGz, 4);
+    prefix += ",";
+    prefix += String(latestMx, 4);
+    prefix += ",";
+    prefix += String(latestMy, 4);
+    prefix += ",";
+    prefix += String(latestMz, 4);
+    prefix += ",";
 
-    // Start（計測開始時刻）のカラムは最初の1行目だけに書く
-    if (!startWritten) {
-        row += measurementStartTime;
-        startWritten = true;
-    }
-
-    // 登録済みのDistance列をすべて出力
+    // 登録済みのDistance列をすべて出力（SD保存用・サーバ送信用で共通）
+    String distanceSuffix;
     for (int c = 0; c < distanceColumnCount; c++) {
-        row += ",";
-
-        bool found = false;
+        distanceSuffix += ",";
 
         for (int i = 0; i < count; i++) {
             if (millis() - snapshot[i].lastSeen > DEVICE_TIMEOUT_MS) continue;
 
-            int childId = snapshot[i].childId;
-
-            if (childId == distanceChildIds[c]) {
-                row += String(snapshot[i].distance, 2);
-                found = true;
+            if (snapshot[i].childId == distanceChildIds[c]) {
+                distanceSuffix += String(snapshot[i].distance, 2);
                 break;
             }
         }
 
-        // found == false の場合は空欄のまま
+        // 見つからない場合は空欄のまま
     }
 
-    row += "\n";
+    // SDカードへの保存用の行（Start＝計測開始時刻は計測全体で最初の1行だけに書く）
+    if (sdCardMounted) {
+        String sdRow = prefix;
 
-    appendToCSVBuffer(row.c_str()); // 新たに作った行を元のCSVバッファへ追記
+        if (!startWritten) {
+            sdRow += measurementStartTime;
+            startWritten = true;
+        }
+
+        sdRow += distanceSuffix;
+        sdRow += "\n";
+
+        appendToCSVBuffer(sdRow.c_str());
+    }
+
+    // サーバ送信用の行
+    // push_csvは送信したCSVの先頭行のStart列から計測開始時刻を読み取る仕様のため、送信バッチごとに先頭行へ書く
+    String sendRow = prefix;
+
+    if (!sendBatchStartWritten) {
+        sendRow += measurementStartTime;
+        sendBatchStartWritten = true;
+    }
+
+    sendRow += distanceSuffix;
+    sendRow += "\n";
+
+    appendToSendBuffer(sendRow.c_str());
 
     csvSampleCount++;
 }
@@ -704,7 +737,7 @@ void resolveDeviceChildIds() {
 
         portENTER_CRITICAL(&sharedStateMux);  // devices[]への同時アクセス回避
         for (int j = 0; j < deviceCount; j++) {
-            if (devices[j].id == snapshot[i].id) {
+            if (strcmp(devices[j].id, snapshot[i].id) == 0) {
                 devices[j].childId = childId;
                 break;
             }
@@ -713,80 +746,56 @@ void resolveDeviceChildIds() {
     }
 }
 
-// サーバへのデータ送信処理を行う関数
-void sendDataToServer(unsigned long timestamp, int steps, float distanceSnapshot) {
+// サーバへ蓄積したCSV行をpush_csvとして送信する関数
+void sendCSVBufferToServer() {
     // Wi-Fiのコネクションを確認
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi not connected!");
         return;
     }
 
-    // タイムスタンプ生成
-    char isoTime[32];
-    getStartTime(isoTime, sizeof(isoTime));
-
-    // JSON組み立て（512バイトに拡張）
-    StaticJsonDocument<512> doc;
+    // 送るデータがまだ無ければ何もしない
+    if (csvSendBufferLen == 0) return;
 
     // 自分の児童IDをDBから参照して設定
     int ownChildId = getChildId(DEVICE_ID);
     if (ownChildId <= 0) return;
 
-    doc["child_id"] = ownChildId;
+    // push_csvは1行目をヘッダーとして読み飛ばす仕様のため、ヘッダーを付けて送信する
+    static const char CSV_HEADER[] = "Timestamp,Steps,Ax,Ay,Az,Gx,Gy,Gz,Mx,My,Mz,Start\n";
+    size_t headerLen = sizeof(CSV_HEADER) - 1; // 末尾のヌル文字を除く
+    size_t totalLen = headerLen + csvSendBufferLen;
 
-    // 歩数情報を格納
-    JsonObject singledata = doc.createNestedObject("singledata");
-    singledata["date"] = isoTime; // タイムスタンプ
-    singledata["steps"] = steps; // 歩数情報
-
-    // 共有配列は短時間でコピーし、HTTP通信中にクリティカルセクションを保持しない
-    DeviceInfo snapshot[20];
-    int count;
-
-    portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
-
-    count = min(deviceCount, 20);
-    for (int i = 0; i < count; i++) snapshot[i] = devices[i];
-
-    portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
-
-    // 相対距離情報を格納（近くにいるデバイス分だけ追加）
-    JsonArray distances = doc.createNestedArray("distances");
-    for (int i = 0; i < count; i++) {
-        // タイムアウトしたデバイスのデータは送信しない
-        if (millis() - snapshot[i].lastSeen > DEVICE_TIMEOUT_MS || snapshot[i].childId <= 0)
-            continue;
-
-        // 自身と同じ児童IDへの距離はサーバの自己参照制約に抵触するため送信しない
-        // BLE名が異なってもDB検索結果が同じIDになる場合がある
-        if (snapshot[i].childId == ownChildId) {
-            Serial.printf("Skipping self distance: %s (child_id=%d)\n", snapshot[i].id.c_str(), ownChildId);
-            continue;
-        }
-
-        JsonObject dist = distances.createNestedObject();
-
-        dist["date"] = isoTime; // タイムスタンプ
-        dist["with_child"] = snapshot[i].childId; // 測定した相手のID
-        dist["distance"] = snapshot[i].distance; // 相対距離情報
+    uint8_t* body = (uint8_t*)malloc(totalLen);
+    if (!body) {
+        Serial.println("CSV送信用バッファのmallocに失敗しました。");
+        return;
     }
 
-    // JSONを文字列へ変換
-    String jsonStr;
-    serializeJson(doc, jsonStr);
-    Serial.println("Sending: " + jsonStr);
+    memcpy(body, CSV_HEADER, headerLen);
+    memcpy(body + headerLen, csvSendBuffer, csvSendBufferLen);
 
-    // HTTPのPOSTでサーバへデータを送信するようにする
+    String url = getApiBaseUrl();
+    url += "/api/push_csv/" + String(ownChildId);
+
     HTTPClient http;
-    http.begin(API_URL); // APIサーバのURLを設定
-    http.addHeader("Content-Type", "application/json");
+    http.begin(url);
+    http.addHeader("Content-Type", "text/csv");
 
-    int httpResponseCode = http.POST(jsonStr);
+    int httpResponseCode = http.POST(body, totalLen);
+
+    free(body);
 
     if (httpResponseCode > 0) {
         Serial.println("HTTP Response: " + String(httpResponseCode));
         String response = http.getString();
         Serial.println("Response: " + response);
+
+        if (httpResponseCode == 200) {
+            // 送信済み分をバッファから消し、次のバッチの先頭行にStartを書けるようにする
+            csvSendBufferLen = 0;
+            sendBatchStartWritten = false;
+        }
     } else {
         Serial.println("Error: " + String(httpResponseCode));
     }
@@ -802,17 +811,13 @@ void sendTask(void *arg)
 
         if (sendFlag) {
             portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
-
-            // ローカル変数へコピーしてから送信する
-            SendData data = sendData;
             sendFlag = false;
-
             portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
             if (WiFi.status() == WL_CONNECTED)
                 resolveDeviceChildIds(); // Wi-Fi接続がされていたらサーバ側と同期させる
 
-            sendDataToServer(data.timestamp, data.steps, data.distance);
+            sendCSVBufferToServer();
         }
 
         vTaskDelay(100 / portTICK_PERIOD_MS);
@@ -886,7 +891,9 @@ void updateDistanceUI() {
         M5.Display.setCursor(listX, y);
 
         // NODE_の部分は削って相対距離の相手の名前は表示させる
-        M5.Display.printf("%s %.1fm", devices[i].id.substring(5).c_str(), devices[i].distance);
+        const char* displayName = devices[i].id;
+        if (strncmp(displayName, "NODE_", 5) == 0) displayName += 5;
+        M5.Display.printf("%s %.1fm", displayName, devices[i].distance);
 
         y += 25;
     }
@@ -1031,17 +1038,9 @@ void loop() {
         lastFlushMillis = now;
     }
 
-    // 一定時間周期で計測データをサーバへ送信
+    // 一定時間周期でサーバへCSVを送信するトリガーを立てる
     if (now - lastSendMillis > SEND_INTERVAL) {
-        portENTER_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
-
-        sendData.timestamp = now / 1000;
-        sendData.steps = stepCount;
-        sendData.distance = distanceMeter;
         sendFlag = true;
-
-        portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
-
         lastSendMillis = now;
     }
 
