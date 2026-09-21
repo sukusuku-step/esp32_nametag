@@ -24,9 +24,10 @@ M5Stack CoreS3 で動作します。BLE Beacon をスキャンして RSSI を取
 
 ### 共通の設定
 
-- `m5` はルートの共有ライブラリ `C:\Users\tugeu\dev\procon26\mvp\libraries` を参照します
-- `ble_send` は共有ライブラリを使わず、レジストリ版の `M5Unified` と `M5GFX` を使います
-- どちらも `post_build.py` を通してビルド後処理を実行します
+- ボード設定とライブラリの参照先はルートの `platformio.ini` にあります
+- 児童名、Wi-Fi接続情報、APIのベースURLは `src/cert.h` で設定します
+- デバイス名は `src/m5_mvp.ino` の `DEVICE_ID` で設定します。相手デバイスも `NODE_児童名` の形式にします
+- API URLには既存のパスが含まれていても、通信時にはホスト部分を使って各APIのパスを組み立てます
 
 ### ビルド
 
@@ -64,9 +65,18 @@ python -m platformio device monitor
 - Wi-Fi経由でのサーバへのCSVデータの送信
 - データ計測とサーバへのデータ送信はデュアルコアで処理
 
+### サーバ送信
+
+計測したCSV行はメモリ上の送信用バッファに蓄積し、10秒ごとに `POST /api/push_csv/{自分の児童ID}` へ `text/csv` として送信します。送信データにはCSVヘッダーを付け、送信時点で登録済みの `Distance_N` 列を含めます。
+
+- Wi-Fiが切断されている間は再接続を試み、送信は次の送信周期まで保留します
+- HTTPステータスが200以外の場合、送信バッファは保持して再送します
+- 送信バッファが満杯になった場合、新しく追加する行は破棄されます
+- SDカードが未装着または初期化に失敗しても、センシングとサーバ送信は継続します
+
 ### 作成するCSVのフォーマット
 
-CSVは以下のフォーマットで保存
+CSVは以下のフォーマットで保存・送信します。`Distance_N` は検出した相手デバイスの児童IDに応じて追加されます。
 
 ```powershell
 Timestamp,Steps,Ax,Ay,Az,Gx,Gy,Gz,Mx,My,Mz,Start,Distance_1,Distance_2,...
@@ -95,6 +105,7 @@ Timestamp,Steps,Ax,Ay,Az,Gx,Gy,Gz,Mx,My,Mz,Start,Distance_1,Distance_2,...
 - 計測していない時刻でのセンシング値はCSVで空欄となる
 - "NODE_児童名"のデバイス名を持った相手デバイスを検出して相対距離を計算
 - 児童名自体は全てDB検索してID値に変換してから扱う
+- `Start` は計測開始時刻をJSTで記録し、SDファイルでは最初の行、サーバ送信では各送信バッチの最初の行に入れる
 
 #### 相手デバイスが増減した場合のフォーマットの例
 
