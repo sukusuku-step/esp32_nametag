@@ -37,7 +37,7 @@
 
 // 対応する児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
 // 名前の重複が無いように基本的にフルネームで登録することとする
-#define DEVICE_ID "NODE_TANAKATARO"
+#define DEVICE_ID "NODE_TSUGE"
 
 #define CSV_BUFFER_SIZE 8192 // CSVバッファのサイズ
 #define MAX_DISTANCE_COLUMNS 30 // CSVバッファのDistanceカラムの最大値
@@ -869,7 +869,7 @@ void sendTask(void *arg)
 void drawUIBase() {
     M5.Display.fillScreen(BLACK);
     M5.Display.setTextColor(WHITE);
-    M5.Display.setBrightness(40); //画面明るさ
+    M5.Display.setBrightness(100); //画面明るさ
 
     // デバイス名
     M5.Display.setTextSize(5);
@@ -1023,7 +1023,7 @@ void setup() {
 
     int dotCount = 0;
     const int WIFI_CONNECT_DOT_INTERVAL_MS = 500; // ドット表示間隔 [ms]
-    const int WIFI_CONNECT_TIMEOUT_DOTS = 20; // タイムアウトまでのドット数
+    const int WIFI_CONNECT_TIMEOUT_DOTS = 20000000; // タイムアウトまでのドット数
 
     while (WiFi.status() != WL_CONNECTED && dotCount < WIFI_CONNECT_TIMEOUT_DOTS) {
         delay(WIFI_CONNECT_DOT_INTERVAL_MS); // Wi-Fi接続試行中にはドットを表示していく
