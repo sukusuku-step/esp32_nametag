@@ -778,7 +778,7 @@ void resolveDeviceChildIds() {
 }
 
 // サーバへ蓄積したCSV行をpush_csvとして送信する関数
-void sendCSVBufferToServer() {
+void sendCSVBufferToServer(int ownChildId) {
     // Wi-Fiのコネクションを確認
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi not connected!");
@@ -788,8 +788,6 @@ void sendCSVBufferToServer() {
     // 送るデータがまだ無ければ何もしない
     if (csvSendBufferLen == 0) return;
 
-    // 自分の児童IDをDBから参照して設定
-    int ownChildId = getChildId(DEVICE_ID);
     if (ownChildId <= 0) return;
 
     // push_csvは1行目をヘッダーとして読み飛ばす仕様のため、現在の列構成を付けて送信する
@@ -840,6 +838,41 @@ void sendCSVBufferToServer() {
     http.end();
 }
 
+// M5のバッテリー残量とWi-Fi RSSIをサーバへ送信する関数
+void sendDeviceStatusToServer(int ownChildId) {
+    int battery = M5.Power.getBatteryLevel();
+    if (battery < 0 || battery > 100) {
+        Serial.println("Invalid battery level; device status was not sent.");
+        return;
+    }
+
+    StaticJsonDocument<128> doc;
+    doc["child_id"] = ownChildId;
+    doc["battery"] = battery;
+    doc["wifi_rssi"] = WiFi.RSSI();
+
+    String body;
+    serializeJson(doc, body);
+
+    String url = getApiBaseUrl();
+    url += "/api/device_status";
+
+    HTTPClient http;
+    if (!http.begin(url)) {
+        Serial.println("Device status HTTP begin failed.");
+        return;
+    }
+
+    http.addHeader("Content-Type", "application/json");
+    int httpResponseCode = http.POST(body);
+    if (httpResponseCode > 0) {
+        Serial.println("Device status HTTP Response: " + String(httpResponseCode));
+    } else {
+        Serial.println("Device status HTTP error: " + String(httpResponseCode));
+    }
+    http.end();
+}
+
 // サーバとの通信用スレッド
 void sendTask(void *arg)
 {
@@ -851,10 +884,15 @@ void sendTask(void *arg)
             sendFlag = false;
             portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
-            if (WiFi.status() == WL_CONNECTED)
+            int ownChildId = -1;
+            if (WiFi.status() == WL_CONNECTED) {
                 resolveDeviceChildIds(); // Wi-Fi接続がされていたらサーバ側と同期させる
+                ownChildId = getChildId(DEVICE_ID);
+                if (ownChildId > 0)
+                    sendDeviceStatusToServer(ownChildId);
+            }
 
-            sendCSVBufferToServer();
+            sendCSVBufferToServer(ownChildId);
         }
 
         vTaskDelay(100 / portTICK_PERIOD_MS);
@@ -869,7 +907,7 @@ void sendTask(void *arg)
 void drawUIBase() {
     M5.Display.fillScreen(BLACK);
     M5.Display.setTextColor(WHITE);
-    M5.Display.setBrightness(100); //画面明るさ
+    M5.Display.setBrightness(40); //画面明るさ
 
     // デバイス名
     M5.Display.setTextSize(5);
