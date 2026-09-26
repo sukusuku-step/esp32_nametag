@@ -71,6 +71,8 @@ unsigned long lastSendMillis = 0;
 
 // Wi-Fi切断時に毎ループで再接続し、CPU負荷やログ出力が増えることを防ぐ
 unsigned long lastWiFiReconnectMillis = 0;
+unsigned int consecutiveCsvSendFailures = 0;
+unsigned int consecutiveStatusSendFailures = 0;
 // SD.begin() が失敗した場合、未マウントのままAPIを呼ばないようにする
 bool sdCardMounted = false;
 
@@ -354,6 +356,7 @@ size_t csvBufferLen = 0;
 // サーバへpush_csvするまでの間、行を貯めておくバッファ（SD用とは別に独立して管理）
 char csvSendBuffer[CSV_BUFFER_SIZE];
 size_t csvSendBufferLen = 0;
+portMUX_TYPE csvSendBufferMux = portMUX_INITIALIZER_UNLOCKED;
 
 // push_csvは送信したCSVの先頭行のStart列から計測開始時刻を読み取る仕様のため、
 // SD保存用のstartWrittenとは別に、送信バッチの先頭行かどうかを管理する
@@ -446,16 +449,68 @@ void appendToCSVBuffer(const char* line) {
 
 // 引数の新たな行をサーバ送信用バッファへ追記する関数
 // 送信が間に合わずバッファが満杯の場合は、次の送信まで新しい行を取りこぼす
-void appendToSendBuffer(const char* line) {
-    size_t lineLen = strlen(line);
+void appendToSendBuffer(const char* prefix, const char* distanceSuffix) {
+    size_t prefixLen = strlen(prefix);
+    size_t suffixLen = strlen(distanceSuffix);
 
+    portENTER_CRITICAL(&csvSendBufferMux);
+    size_t startLen = sendBatchStartWritten ? 0 : strlen(measurementStartTime);
+    size_t lineLen = prefixLen + startLen + suffixLen + 1;
     if (csvSendBufferLen + lineLen >= CSV_BUFFER_SIZE) {
+        portEXIT_CRITICAL(&csvSendBufferMux);
         Serial.println("CSV send buffer is full; dropping a row.");
         return;
     }
 
-    memcpy(csvSendBuffer + csvSendBufferLen, line, lineLen);
-    csvSendBufferLen += lineLen;
+    memcpy(csvSendBuffer + csvSendBufferLen, prefix, prefixLen);
+    csvSendBufferLen += prefixLen;
+    if (startLen > 0) {
+        memcpy(csvSendBuffer + csvSendBufferLen, measurementStartTime, startLen);
+        csvSendBufferLen += startLen;
+    }
+    memcpy(csvSendBuffer + csvSendBufferLen, distanceSuffix, suffixLen);
+    csvSendBufferLen += suffixLen;
+    csvSendBuffer[csvSendBufferLen++] = '\n';
+    sendBatchStartWritten = true;
+    portEXIT_CRITICAL(&csvSendBufferMux);
+}
+
+// 送信成功時に送信済み行だけを除き、残ったバッチの先頭行にStart時刻を戻す。
+void ensureFirstSendRowHasStartLocked() {
+    if (csvSendBufferLen == 0) {
+        sendBatchStartWritten = false;
+        return;
+    }
+
+    size_t commaCount = 0;
+    size_t insertPosition = 0;
+    for (size_t i = 0; i < csvSendBufferLen && csvSendBuffer[i] != '\n'; i++) {
+        if (csvSendBuffer[i] == ',' && ++commaCount == 11) {
+            insertPosition = i + 1;
+            break;
+        }
+    }
+
+    if (insertPosition > 0 &&
+        (csvSendBuffer[insertPosition] == ',' || csvSendBuffer[insertPosition] == '\n')) {
+        size_t startLen = strlen(measurementStartTime);
+        if (csvSendBufferLen + startLen < CSV_BUFFER_SIZE) {
+            memmove(csvSendBuffer + insertPosition + startLen,
+                    csvSendBuffer + insertPosition,
+                    csvSendBufferLen - insertPosition);
+            memcpy(csvSendBuffer + insertPosition, measurementStartTime, startLen);
+            csvSendBufferLen += startLen;
+        }
+    }
+    sendBatchStartWritten = true;
+}
+
+// 送信待ちの行があるかを確認する。
+bool hasPendingSendData() {
+    portENTER_CRITICAL(&csvSendBufferMux);
+    bool hasData = csvSendBufferLen > 0;
+    portEXIT_CRITICAL(&csvSendBufferMux);
+    return hasData;
 }
 
 // 送信バッファ内の既存行にもDistance列の空欄を追加する
@@ -490,10 +545,14 @@ bool addDistanceColumn(int childId) {
 
     // SDが使えない場合も、サーバ送信用の列構成は維持する
     if (!sdCardMounted) {
-        if (!appendDistanceColumnToSendBuffer()) return false;
-
-        distanceChildIds[distanceColumnCount] = childId;
-        distanceColumnCount++;
+        portENTER_CRITICAL(&csvSendBufferMux);
+        bool appended = appendDistanceColumnToSendBuffer();
+        if (appended) {
+            distanceChildIds[distanceColumnCount] = childId;
+            distanceColumnCount++;
+        }
+        portEXIT_CRITICAL(&csvSendBufferMux);
+        if (!appended) return false;
         return true;
     }
 
@@ -564,11 +623,14 @@ bool addDistanceColumn(int childId) {
         return false;
     }
 
-    if (!appendDistanceColumnToSendBuffer()) return false;
-
-    // Distance列を登録
-    distanceChildIds[distanceColumnCount] = childId;
-    distanceColumnCount++;
+    portENTER_CRITICAL(&csvSendBufferMux);
+    bool appended = appendDistanceColumnToSendBuffer();
+    if (appended) {
+        distanceChildIds[distanceColumnCount] = childId;
+        distanceColumnCount++;
+    }
+    portEXIT_CRITICAL(&csvSendBufferMux);
+    if (!appended) return false;
 
     Serial.print("Added Distance_");
     Serial.println(childId);
@@ -694,19 +756,8 @@ void saveDataToCSV() {
         appendToCSVBuffer(sdRow.c_str());
     }
 
-    // サーバ送信用の行
-    // push_csvは送信したCSVの先頭行のStart列から計測開始時刻を読み取る仕様のため、送信バッチごとに先頭行へ書く
-    String sendRow = prefix;
-
-    if (!sendBatchStartWritten) {
-        sendRow += measurementStartTime;
-        sendBatchStartWritten = true;
-    }
-
-    sendRow += distanceSuffix;
-    sendRow += "\n";
-
-    appendToSendBuffer(sendRow.c_str());
+    // Start列の有無は送信バッファのロック中に決め、送信中の更新と競合させない
+    appendToSendBuffer(prefix.c_str(), distanceSuffix.c_str());
 
     csvSampleCount++;
 }
@@ -744,6 +795,25 @@ void reconnectWiFiIfNeeded() {
     WiFi.reconnect();
 }
 
+// 同じ種類の送信が2回続けて失敗したらWi-Fi接続を張り直す。
+void recordServerSendResult(bool succeeded, unsigned int& consecutiveFailures, const char* dataType) {
+    if (succeeded) {
+        consecutiveFailures = 0;
+        return;
+    }
+
+    consecutiveFailures++;
+    Serial.println(String(dataType) + " send failed (" + consecutiveFailures + "/2)");
+    if (consecutiveFailures < 2) return;
+
+    consecutiveCsvSendFailures = 0;
+    consecutiveStatusSendFailures = 0;
+    Serial.println("Repeated server send failures; restarting WiFi connection...");
+    WiFi.disconnect(false, false);
+    lastWiFiReconnectMillis = millis();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
+
 // センシングをサーバ側と同期させる関数
 void resolveDeviceChildIds() {
     DeviceInfo snapshot[20];
@@ -779,42 +849,78 @@ void resolveDeviceChildIds() {
 
 // サーバへ蓄積したCSV行をpush_csvとして送信する関数
 void sendCSVBufferToServer(int ownChildId) {
+    if (!hasPendingSendData()) return;
+
     // Wi-Fiのコネクションを確認
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi not connected!");
+        recordServerSendResult(false, consecutiveCsvSendFailures, "CSV");
         return;
     }
 
-    // 送るデータがまだ無ければ何もしない
-    if (csvSendBufferLen == 0) return;
+    if (ownChildId <= 0) {
+        Serial.println("CSV send skipped because child ID is unavailable.");
+        recordServerSendResult(false, consecutiveCsvSendFailures, "CSV");
+        return;
+    }
 
-    if (ownChildId <= 0) return;
+    uint8_t* body = (uint8_t*)malloc(CSV_BUFFER_SIZE + 1024);
+    if (!body) {
+        Serial.println("CSV送信用バッファのmallocに失敗しました。");
+        recordServerSendResult(false, consecutiveCsvSendFailures, "CSV");
+        return;
+    }
+
+    size_t batchLen = 0;
+    size_t batchRowCount = 0;
+    int batchDistanceColumnCount = 0;
+    int batchDistanceChildIds[MAX_DISTANCE_COLUMNS];
+    portENTER_CRITICAL(&csvSendBufferMux);
+    batchLen = csvSendBufferLen;
+    if (batchLen > 0) {
+        memcpy(body, csvSendBuffer, batchLen);
+        for (size_t i = 0; i < batchLen; i++) {
+            if (csvSendBuffer[i] == '\n') batchRowCount++;
+        }
+    }
+    batchDistanceColumnCount = distanceColumnCount;
+    memcpy(batchDistanceChildIds, distanceChildIds,
+           batchDistanceColumnCount * sizeof(batchDistanceChildIds[0]));
+    portEXIT_CRITICAL(&csvSendBufferMux);
+
+    if (batchLen == 0) {
+        free(body);
+        return;
+    }
 
     // push_csvは1行目をヘッダーとして読み飛ばす仕様のため、現在の列構成を付けて送信する
     String csvHeader = "Timestamp,Steps,Ax,Ay,Az,Gx,Gy,Gz,Mx,My,Mz,Start";
-    for (int i = 0; i < distanceColumnCount; i++) {
+    for (int i = 0; i < batchDistanceColumnCount; i++) {
         csvHeader += ",Distance_";
-        csvHeader += String(distanceChildIds[i]);
+        csvHeader += String(batchDistanceChildIds[i]);
     }
     csvHeader += "\n";
 
     size_t headerLen = csvHeader.length();
-    size_t totalLen = headerLen + csvSendBufferLen;
-
-    uint8_t* body = (uint8_t*)malloc(totalLen);
-    if (!body) {
-        Serial.println("CSV送信用バッファのmallocに失敗しました。");
+    size_t totalLen = headerLen + batchLen;
+    if (totalLen > CSV_BUFFER_SIZE + 1024) {
+        free(body);
+        recordServerSendResult(false, consecutiveCsvSendFailures, "CSV");
         return;
     }
-
+    memmove(body + headerLen, body, batchLen);
     memcpy(body, csvHeader.c_str(), headerLen);
-    memcpy(body + headerLen, csvSendBuffer, csvSendBufferLen);
 
     String url = getApiBaseUrl();
     url += "/api/push_csv/" + String(ownChildId);
 
     HTTPClient http;
-    http.begin(url);
+    if (!http.begin(url)) {
+        Serial.println("CSV HTTP begin failed.");
+        free(body);
+        recordServerSendResult(false, consecutiveCsvSendFailures, "CSV");
+        return;
+    }
     http.addHeader("Content-Type", "text/csv");
 
     int httpResponseCode = http.POST(body, totalLen);
@@ -827,15 +933,27 @@ void sendCSVBufferToServer(int ownChildId) {
         Serial.println("Response: " + response);
 
         if (httpResponseCode == 200) {
-            // 送信済み分をバッファから消し、次のバッチの先頭行にStartを書けるようにする
-            csvSendBufferLen = 0;
-            sendBatchStartWritten = false;
+            // POST中に追加された行を残し、送信開始時点の行だけを取り除く
+            portENTER_CRITICAL(&csvSendBufferMux);
+            size_t removeBytes = 0;
+            size_t removedRows = 0;
+            while (removeBytes < csvSendBufferLen && removedRows < batchRowCount) {
+                if (csvSendBuffer[removeBytes++] == '\n') removedRows++;
+            }
+            if (removedRows == batchRowCount && removeBytes > 0) {
+                memmove(csvSendBuffer, csvSendBuffer + removeBytes,
+                        csvSendBufferLen - removeBytes);
+                csvSendBufferLen -= removeBytes;
+                ensureFirstSendRowHasStartLocked();
+            }
+            portEXIT_CRITICAL(&csvSendBufferMux);
         }
     } else {
         Serial.println("Error: " + String(httpResponseCode));
     }
 
     http.end();
+    recordServerSendResult(httpResponseCode == 200, consecutiveCsvSendFailures, "CSV");
 }
 
 // M5のバッテリー残量とWi-Fi RSSIをサーバへ送信する関数
@@ -843,6 +961,7 @@ void sendDeviceStatusToServer(int ownChildId) {
     int battery = M5.Power.getBatteryLevel();
     if (battery < 0 || battery > 100) {
         Serial.println("Invalid battery level; device status was not sent.");
+        recordServerSendResult(false, consecutiveStatusSendFailures, "Device status");
         return;
     }
 
@@ -860,6 +979,7 @@ void sendDeviceStatusToServer(int ownChildId) {
     HTTPClient http;
     if (!http.begin(url)) {
         Serial.println("Device status HTTP begin failed.");
+        recordServerSendResult(false, consecutiveStatusSendFailures, "Device status");
         return;
     }
 
@@ -871,6 +991,7 @@ void sendDeviceStatusToServer(int ownChildId) {
         Serial.println("Device status HTTP error: " + String(httpResponseCode));
     }
     http.end();
+    recordServerSendResult(httpResponseCode == 200, consecutiveStatusSendFailures, "Device status");
 }
 
 // サーバとの通信用スレッド
@@ -885,11 +1006,17 @@ void sendTask(void *arg)
             portEXIT_CRITICAL(&sharedStateMux); // devices[]への同時アクセス回避
 
             int ownChildId = -1;
+            bool hasCsvData = hasPendingSendData();
             if (WiFi.status() == WL_CONNECTED) {
                 resolveDeviceChildIds(); // Wi-Fi接続がされていたらサーバ側と同期させる
                 ownChildId = getChildId(DEVICE_ID);
-                if (ownChildId > 0)
+                if (ownChildId > 0) {
                     sendDeviceStatusToServer(ownChildId);
+                } else if (!hasCsvData) {
+                    recordServerSendResult(false, consecutiveStatusSendFailures, "Device status");
+                }
+            } else if (!hasCsvData) {
+                recordServerSendResult(false, consecutiveStatusSendFailures, "Device status");
             }
 
             sendCSVBufferToServer(ownChildId);
