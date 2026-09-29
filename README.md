@@ -67,7 +67,7 @@ python -m platformio device monitor
 
 ### サーバ送信
 
-計測したCSV行はメモリ上の送信用バッファに蓄積し、10秒ごとに `POST /api/push_csv/{自分の児童ID}` へ `text/csv` として送信します。送信データにはCSVヘッダーを付け、送信時点で登録済みの `Distance_N` 列を含めます。
+計測したCSV行はメモリ上の送信用バッファに蓄積し、10秒ごとに `POST /api/push_csv/{自分の児童ID}` へ `text/csv` として送信します。送信データにはCSVヘッダーを付け、送信時点で登録済みの `Distance_N` 列を含めます。同じ周期で `POST /api/device_status` にバッテリー残量（%）とWi-Fi RSSI（dBm）も送信します。
 
 - Wi-Fiが切断されている間は再接続を試み、送信は次の送信周期まで保留します
 - HTTPステータスが200以外の場合、送信バッファは保持して再送します
