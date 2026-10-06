@@ -10,6 +10,10 @@
 #include <time.h>
 #include "cert.h"
 
+#ifndef AUTO_UPDATE_SERVER_URL
+#define AUTO_UPDATE_SERVER_URL "http://10.172.66.7:8000"
+#endif
+
 // ======================================================
 // マルチスレッドの構成
 //
@@ -38,6 +42,7 @@
 // 対応する児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
 // 名前の重複が無いように基本的にフルネームで登録することとする
 #define DEVICE_ID "NODE_TEST"
+#define AUTO_UPDATE_NAME_MAX_BYTES 24
 
 #define CSV_BUFFER_SIZE 8192 // CSVバッファのサイズ
 #define MAX_DISTANCE_COLUMNS 30 // CSVバッファのDistanceカラムの最大値
@@ -85,6 +90,10 @@ const unsigned long SEND_INTERVAL = 10000; // 計測データのサーバへの�
 // Wi-Fi切断中の再接続試行間隔 [ms]（画面・センシング処理を阻害しないよう間隔を空ける）
 const unsigned long WIFI_RECONNECT_INTERVAL = 5000;
 
+portMUX_TYPE deviceNameMux = portMUX_INITIALIZER_UNLOCKED;
+char activeDeviceId[32] = DEVICE_ID;
+BLEAdvertising* pAdvertising;
+
 // ======================================================
 // 児童ID・BLEデバイス管理
 // ======================================================
@@ -98,6 +107,100 @@ String getApiBaseUrl() {
         url = url.substring(0, pathPos);
 
     return url;
+}
+
+String urlEncode(const String& value) {
+    static const char hex[] = "0123456789ABCDEF";
+    String encoded;
+    encoded.reserve(value.length() * 3);
+
+    for (size_t i = 0; i < value.length(); i++) {
+        uint8_t byte = static_cast<uint8_t>(value[i]);
+        if ((byte >= 'a' && byte <= 'z') ||
+            (byte >= 'A' && byte <= 'Z') ||
+            (byte >= '0' && byte <= '9') ||
+            byte == '-' || byte == '_' || byte == '.' || byte == '~') {
+            encoded += static_cast<char>(byte);
+        } else {
+            encoded += '%';
+            encoded += hex[byte >> 4];
+            encoded += hex[byte & 0x0F];
+        }
+    }
+    return encoded;
+}
+
+void getActiveDeviceId(char* buffer, size_t bufferSize) {
+    portENTER_CRITICAL(&deviceNameMux);
+    strlcpy(buffer, activeDeviceId, bufferSize);
+    portEXIT_CRITICAL(&deviceNameMux);
+}
+
+String getActiveDeviceId() {
+    char deviceId[sizeof(activeDeviceId)];
+    getActiveDeviceId(deviceId, sizeof(deviceId));
+    return String(deviceId);
+}
+
+// 名札名をサーバーから取得し、BLE名を更新する
+bool updateDeviceNameFromServer() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    String url = AUTO_UPDATE_SERVER_URL;
+    while (url.endsWith("/")) url.remove(url.length() - 1);
+    url += "/api/name";
+
+    HTTPClient http;
+    http.setTimeout(3000);
+    if (!http.begin(url)) {
+        Serial.println("Name update HTTP begin failed.");
+        return false;
+    }
+    http.addHeader("Accept", "application/json");
+
+    int responseCode = http.GET();
+    if (responseCode != 200) {
+        Serial.printf("Name update HTTP response: %d\n", responseCode);
+        http.end();
+        return false;
+    }
+
+    JsonDocument response;
+    DeserializationError error = deserializeJson(response, http.getStream());
+    http.end();
+    if (error) {
+        Serial.printf("Name update JSON parse failed: %s\n", error.c_str());
+        return false;
+    }
+
+    const char* name = response["name"];
+    if (name == nullptr || name[0] == '\0') return true;
+    if (strlen(name) > AUTO_UPDATE_NAME_MAX_BYTES) {
+        Serial.println("Name update ignored: name exceeds BLE advertising limit.");
+        return false;
+    }
+    for (const unsigned char* character = (const unsigned char*)name; *character; character++) {
+        if (*character < 32 || *character == 127) {
+            Serial.println("Name update ignored: name contains control characters.");
+            return false;
+        }
+    }
+
+    String newDeviceId = "NODE_";
+    newDeviceId += name;
+    if (newDeviceId == getActiveDeviceId()) return true;
+
+    portENTER_CRITICAL(&deviceNameMux);
+    strlcpy(activeDeviceId, newDeviceId.c_str(), sizeof(activeDeviceId));
+    portEXIT_CRITICAL(&deviceNameMux);
+
+    BLEAdvertisementData advertisementData;
+    advertisementData.setName(newDeviceId.c_str());
+    pAdvertising->stop();
+    pAdvertising->setAdvertisementData(advertisementData);
+    pAdvertising->start();
+    Serial.println("Device name updated from server.");
+    return true;
 }
 
 // 児童名から対応するID値をDB検索して取得する関数
@@ -116,7 +219,7 @@ int getChildId(const String& deviceName) {
 
     // IDを取得するAPIのURLを作成する
     String url = getApiBaseUrl();
-    url += "/api/children/search?name=" + name;
+    url += "/api/children/search?name=" + urlEncode(name);
 
     Serial.println("Child ID search:");
     Serial.println("  name = " + name);
@@ -203,7 +306,6 @@ float calculateDistance(int rssi) {
 }
 
 BLEScan* pBLEScan;
-BLEAdvertising* pAdvertising;
 TaskHandle_t bleTaskHandle;
 TaskHandle_t sendTaskHandle;
 portMUX_TYPE sharedStateMux = portMUX_INITIALIZER_UNLOCKED;
@@ -253,7 +355,7 @@ class MyCallbacks : public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice device) {
         String name = device.getName().c_str();
 
-        if (!name.startsWith("NODE") || name == DEVICE_ID)
+        if (!name.startsWith("NODE") || name == getActiveDeviceId())
             return;
 
         int rssi = device.getRSSI();
@@ -1009,7 +1111,7 @@ void sendTask(void *arg)
             bool hasCsvData = hasPendingSendData();
             if (WiFi.status() == WL_CONNECTED) {
                 resolveDeviceChildIds(); // Wi-Fi接続がされていたらサーバ側と同期させる
-                ownChildId = getChildId(DEVICE_ID);
+                ownChildId = getChildId(getActiveDeviceId());
                 if (ownChildId > 0) {
                     sendDeviceStatusToServer(ownChildId);
                 } else if (!hasCsvData) {
@@ -1039,7 +1141,8 @@ void drawUIBase() {
     // デバイス名
     M5.Display.setTextSize(5);
     M5.Display.setCursor(20, 20);
-    M5.Display.println(String(DEVICE_ID).substring(5)); // NODE_の部分は削って表示させる
+    String deviceId = getActiveDeviceId();
+    M5.Display.println(deviceId.startsWith("NODE_") ? deviceId.substring(5) : deviceId);
 
     // STEPのラベル
     M5.Display.setTextSize(3);
@@ -1203,6 +1306,7 @@ void setup() {
         M5.Lcd.println(WiFi.localIP()); // デバイスのローカルIPアドレスを表示
 
         syncTimeWithNTP(); // Wi-Fi接続時のみ時刻同期
+        updateDeviceNameFromServer(); // Wi-Fi接続後に名札名を同期
     } else {
         M5.Lcd.fillScreen(BLACK);
         M5.Lcd.println("WiFi Timeout"); // Wi-Fi接続タイムアウト
@@ -1227,6 +1331,14 @@ void loop() {
     updateStepCount(); // 最新のセンシング値から歩数を計算して更新
 
     unsigned long now = millis();
+    static char lastDisplayedDeviceId[sizeof(activeDeviceId)] = DEVICE_ID;
+    char currentDeviceId[sizeof(activeDeviceId)];
+    getActiveDeviceId(currentDeviceId, sizeof(currentDeviceId));
+    if (strcmp(lastDisplayedDeviceId, currentDeviceId) != 0) {
+        drawUIBase();
+        strlcpy(lastDisplayedDeviceId, currentDeviceId, sizeof(lastDisplayedDeviceId));
+        lastUI = 0;
+    }
 
     // 一定時間周期でCSVバッファを更新
     if (now - lastCSVMillis >= CSV_INTERVAL) {
