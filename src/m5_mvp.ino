@@ -477,17 +477,38 @@ void initSDCard() {
 }
 
 // NTPによる時刻同期
-void syncTimeWithNTP() {
-    configTime(9 * 3600, 0, "ntp.nict.jp", "time.google.com"); // JST（UTC+9）で同期
+// 2024-01-01以降なら同期済みとみなす（未同期の場合は1970年付近になる）
+bool isTimeSynced() {
+    return time(nullptr) > 1704067200;
+}
 
-    struct tm timeinfo;
+// 同期できるまでサーバを切り替えながら再試行し、成功したらtrueを返す
+bool syncTimeWithNTP() {
+    const int NTP_MAX_ATTEMPTS = 12;
+    const char* servers[][2] = {
+        {"ntp.nict.jp", "time.google.com"},
+        {"time.google.com", "pool.ntp.org"},
+    };
 
-    if (getLocalTime(&timeinfo, 5000)) {
-        // 最大5秒待つ
-        Serial.println("NTP time synced");
-    } else {
-        Serial.println("NTP time sync failed");
+    for (int attempt = 0; attempt < NTP_MAX_ATTEMPTS; attempt++) {
+        if (WiFi.status() != WL_CONNECTED) {
+            delay(1000);
+            continue;
+        }
+
+        const char** pair = servers[attempt % 2];
+        configTime(9 * 3600, 0, pair[0], pair[1]); // JST（UTC+9）で同期
+
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo, 5000) && isTimeSynced()) {
+            Serial.println("NTP time synced");
+            return true;
+        }
+
+        Serial.printf("NTP time sync failed (%d/%d)\n", attempt + 1, NTP_MAX_ATTEMPTS);
     }
+
+    return false;
 }
 
 // 計測開始時刻を取得する関数
@@ -503,6 +524,12 @@ void getStartTime(char* buffer, size_t size) {
 
 // CSVバッファを初期化する関数（最初に一度呼ばれる）
 void createNewCSVFile() {
+    // 計測開始時刻はSDの有無に関わらずサーバ送信にも必要
+    getStartTime(measurementStartTime, sizeof(measurementStartTime));
+    distanceColumnCount = 0;
+    csvSampleCount = 0;
+    startWritten = false;
+
     // SD未装着・初期化失敗時は計測とネットワーク送信を継続し、CSVの保存処理だけ停止
     if (!sdCardMounted) return;
 
@@ -513,13 +540,7 @@ void createNewCSVFile() {
             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
             t->tm_hour, t->tm_min, t->tm_sec);
 
-    // 計測開始時刻を取得する
-    getStartTime(measurementStartTime, sizeof(measurementStartTime));
-
-    distanceColumnCount = 0;
-    csvSampleCount = 0;
-    startWritten = false;
-
+    // 計測開始時刻はファイル名と同じ時刻
     File file = SD.open(csvFileName, FILE_WRITE);
     if (!file) {
         Serial.println("CSV file creation failed.");
@@ -1132,6 +1153,9 @@ void sendTask(void *arg)
 // UI描画処理
 // ======================================================
 
+int oldStepUI = -1;
+int oldBatteryUI = -1;
+
 // UI初期描画
 void drawUIBase() {
     M5.Display.fillScreen(BLACK);
@@ -1152,13 +1176,11 @@ void drawUIBase() {
 
 // STEP部分のUI更新
 void updateStepUI() {
-    static int oldStep = -1;
-
     // 表示する値が変わっていない場合は更新する必要がない
-    if (oldStep == stepCount)
+    if (oldStepUI == stepCount)
         return;
 
-    oldStep = stepCount; // 以前の値を覚えておく
+    oldStepUI = stepCount; // 以前の値を覚えておく
 
     // 数字だけ消す
     M5.Display.fillRect(120, 90, 120, 30, BLACK);
@@ -1208,8 +1230,6 @@ void updateDistanceUI() {
 
 // Battery部分のUI更新
 void updateBatteryUI() {
-    static int oldBattery = -1;
-
     int battery = M5.Power.getBatteryLevel();
 
     // 取得失敗（-1などの無効値）は無視して、前回表示を維持する
@@ -1217,10 +1237,10 @@ void updateBatteryUI() {
         return;
     
     // 表示する値が変わっていない場合は更新する必要がない
-    if (battery == oldBattery)
+    if (battery == oldBatteryUI)
         return;
 
-    oldBattery = battery; // 以前の値を覚えておく
+    oldBatteryUI = battery; // 以前の値を覚えておく
 
     const int x = M5.Display.width() - 160;
     const int y = M5.Display.height() - 30;
@@ -1305,7 +1325,11 @@ void setup() {
         M5.Lcd.print("IP address = ");
         M5.Lcd.println(WiFi.localIP()); // デバイスのローカルIPアドレスを表示
 
-        syncTimeWithNTP(); // Wi-Fi接続時のみ時刻同期
+        // 計測開始時刻が空にならないよう、同期できるまで再試行する
+        M5.Lcd.println("NTP syncing...");
+        while (!syncTimeWithNTP()) {
+            M5.Lcd.println("NTP retry...");
+        }
         updateDeviceNameFromServer(); // Wi-Fi接続後に名札名を同期
     } else {
         M5.Lcd.fillScreen(BLACK);
@@ -1336,6 +1360,9 @@ void loop() {
     getActiveDeviceId(currentDeviceId, sizeof(currentDeviceId));
     if (strcmp(lastDisplayedDeviceId, currentDeviceId) != 0) {
         drawUIBase();
+        oldStepUI = -1;
+        oldBatteryUI = -1;
+        drawUI();
         strlcpy(lastDisplayedDeviceId, currentDeviceId, sizeof(lastDisplayedDeviceId));
         lastUI = 0;
     }
