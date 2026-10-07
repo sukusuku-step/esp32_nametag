@@ -1079,9 +1079,24 @@ void sendCSVBufferToServer(int ownChildId) {
     recordServerSendResult(httpResponseCode == 200, consecutiveCsvSendFailures, "CSV");
 }
 
+// バッテリー残量(%)を取得する関数
+// 12%付近で電源が切れてしまうため、12%〜100%を0%〜100%に補正する
+int getBatteryLevel() {
+    int raw = M5.Power.getBatteryLevel();
+    if (raw < 0 || raw > 100) {
+        return raw;
+    }
+    const int BATTERY_CUTOFF_PERCENT = 12;
+    if (raw <= BATTERY_CUTOFF_PERCENT) {
+        return 0;
+    }
+    int adjusted = (int)round((raw - BATTERY_CUTOFF_PERCENT) * 100.0 / (100.0 - BATTERY_CUTOFF_PERCENT));
+    return constrain(adjusted, 0, 100);
+}
+
 // M5のバッテリー残量とWi-Fi RSSIをサーバへ送信する関数
 void sendDeviceStatusToServer(int ownChildId) {
-    int battery = M5.Power.getBatteryLevel();
+    int battery = getBatteryLevel();
     if (battery < 0 || battery > 100) {
         Serial.println("Invalid battery level; device status was not sent.");
         recordServerSendResult(false, consecutiveStatusSendFailures, "Device status");
@@ -1230,7 +1245,7 @@ void updateDistanceUI() {
 
 // Battery部分のUI更新
 void updateBatteryUI() {
-    int battery = M5.Power.getBatteryLevel();
+    int battery = getBatteryLevel();
 
     // 取得失敗（-1などの無効値）は無視して、前回表示を維持する
     if (battery < 0)
