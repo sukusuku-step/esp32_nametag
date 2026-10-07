@@ -48,6 +48,7 @@
 #define MAX_DISTANCE_COLUMNS 30 // CSVバッファのDistanceカラムの最大値
 #define DEVICE_TIMEOUT_MS 10000 // 相対距離測定の際の相手デバイスのタイムアウト時間
 #define UI_UPDATE_MS 10000 // 画面更新頻度
+#define SCREEN_SLEEP_TIMEOUT_MS 30000 // 画面スリープまでの無操作時間 [ms] (30秒)
 
 // 累計歩数のカウント
 volatile int stepCount = 0;
@@ -73,6 +74,8 @@ char csvFileName[48] = "";
 unsigned long lastCSVMillis = 0;
 unsigned long lastFlushMillis = 0;
 unsigned long lastSendMillis = 0;
+unsigned long lastScreenTouchMillis = 0; // 最後に画面操作があった時刻
+bool isScreenSleeping = false; // 画面スリープ状態（画面描画・バックライトOFF）
 
 // Wi-Fi切断時に毎ループで再接続し、CPU負荷やログ出力が増えることを防ぐ
 unsigned long lastWiFiReconnectMillis = 0;
@@ -1277,6 +1280,30 @@ void drawUI() {
     updateBatteryUI();
 }
 
+// 画面スリープ（バックライト消灯・描画停止）
+void sleepScreen() {
+    if (isScreenSleeping)
+        return;
+    isScreenSleeping = true;
+    M5.Display.sleep();
+    M5.Display.setBrightness(0);
+    Serial.println("Screen sleep activated.");
+}
+
+// 画面復帰（バックライト点灯・UI再描画）
+void wakeupScreen() {
+    if (!isScreenSleeping)
+        return;
+    isScreenSleeping = false;
+    M5.Display.wakeup();
+    M5.Display.setBrightness(40);
+    drawUIBase();
+    oldStepUI = -1;
+    oldBatteryUI = -1;
+    drawUI();
+    Serial.println("Screen wakeup activated.");
+}
+
 // ======================================================
 // デバイスのセットアップ
 // ======================================================
@@ -1356,6 +1383,9 @@ void setup() {
 
     drawUIBase(); // UIの初期描画
     updateBatteryUI(); // 初回のバッテリー残量を表示
+
+    lastScreenTouchMillis = millis();
+    isScreenSleeping = false;
 }
 
 // ======================================================
@@ -1366,18 +1396,44 @@ unsigned long lastUI = 0; // 画面更新頻度のパラメータ
 
 // メインループ処理
 void loop() {
+    M5.update(); // タッチ・ボタン状態の更新
+
+    unsigned long now = millis();
+
+    // 画面タップ・操作の検知（CoreS3画面タッチ・仮想ボタン）
+    bool isTouched = (M5.Touch.getCount() > 0) ||
+                     M5.Touch.getDetail().wasClicked() ||
+                     M5.Touch.getDetail().wasPressed() ||
+                     M5.BtnPWR.wasClicked() ||
+                     M5.BtnA.wasPressed() ||
+                     M5.BtnB.wasPressed() ||
+                     M5.BtnC.wasPressed();
+
+    if (isTouched) {
+        if (isScreenSleeping) {
+            wakeupScreen();
+        }
+        lastScreenTouchMillis = now;
+    }
+
+    // 30秒間操作がなければ画面をスリープ
+    if (!isScreenSleeping && (now - lastScreenTouchMillis >= SCREEN_SLEEP_TIMEOUT_MS)) {
+        sleepScreen();
+    }
+
     updateSensors(); // センシングした値を更新
     updateStepCount(); // 最新のセンシング値から歩数を計算して更新
 
-    unsigned long now = millis();
     static char lastDisplayedDeviceId[sizeof(activeDeviceId)] = DEVICE_ID;
     char currentDeviceId[sizeof(activeDeviceId)];
     getActiveDeviceId(currentDeviceId, sizeof(currentDeviceId));
     if (strcmp(lastDisplayedDeviceId, currentDeviceId) != 0) {
-        drawUIBase();
-        oldStepUI = -1;
-        oldBatteryUI = -1;
-        drawUI();
+        if (!isScreenSleeping) {
+            drawUIBase();
+            oldStepUI = -1;
+            oldBatteryUI = -1;
+            drawUI();
+        }
         strlcpy(lastDisplayedDeviceId, currentDeviceId, sizeof(lastDisplayedDeviceId));
         lastUI = 0;
     }
@@ -1400,9 +1456,11 @@ void loop() {
         lastSendMillis = now;
     }
 
-    // 一定時間周期で画面更新
+    // 一定時間周期で画面更新（スリープ中は描画スキップ）
     if (now - lastUI > UI_UPDATE_MS) { 
-        drawUI(); // 必要な部分だけ数値の表示を更新する
+        if (!isScreenSleeping) {
+            drawUI(); // 必要な部分だけ数値の表示を更新する
+        }
         lastUI = now;
     }
 
