@@ -766,9 +766,6 @@ bool addDistanceColumn(int childId) {
 
 // 新たに検出された児童がいるかどうかを確認する関数
 void updateDistanceColumns() {
-    // Distance列の追加はファイル更新を伴うため、SDが利用できる場合だけ実行する
-    if (!sdCardMounted) return;
-
     DeviceInfo snapshot[20];
     int count;
 
@@ -801,7 +798,7 @@ void updateDistanceColumns() {
 
 // 現時点での計測データからCSVバッファ（SD保存用・サーバ送信用）を更新する関数
 void saveDataToCSV() {
-    updateDistanceColumns(); // 現状の相対距離測定の相手デバイスを確認する（SD未マウント時は列追加のみスキップされる）
+    updateDistanceColumns(); // 現状の相対距離測定の相手デバイスを確認する（SD未マウント時も送信用バッファに列追加が反映される）
 
     // ======================================================
     // この時点で必要な分のCSVのカラムは用意は完了済み
