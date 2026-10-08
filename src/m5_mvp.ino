@@ -10,6 +10,10 @@
 #include <time.h>
 #include "cert.h"
 
+#ifndef AUTO_UPDATE_SERVER_URL
+#define AUTO_UPDATE_SERVER_URL "http://10.172.66.7:8000"
+#endif
+
 // ======================================================
 // マルチスレッドの構成
 //
@@ -37,12 +41,14 @@
 
 // 対応する児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
 // 名前の重複が無いように基本的にフルネームで登録することとする
-#define DEVICE_ID "NODE_TEST"
+#define DEVICE_ID "NODE_TESUTO"
+#define AUTO_UPDATE_NAME_MAX_BYTES 24
 
 #define CSV_BUFFER_SIZE 8192 // CSVバッファのサイズ
 #define MAX_DISTANCE_COLUMNS 30 // CSVバッファのDistanceカラムの最大値
 #define DEVICE_TIMEOUT_MS 10000 // 相対距離測定の際の相手デバイスのタイムアウト時間
 #define UI_UPDATE_MS 10000 // 画面更新頻度
+#define SCREEN_SLEEP_TIMEOUT_MS 30000 // 画面スリープまでの無操作時間 [ms] (30秒)
 
 // 累計歩数のカウント
 volatile int stepCount = 0;
@@ -68,6 +74,8 @@ char csvFileName[48] = "";
 unsigned long lastCSVMillis = 0;
 unsigned long lastFlushMillis = 0;
 unsigned long lastSendMillis = 0;
+unsigned long lastScreenTouchMillis = 0; // 最後に画面操作があった時刻
+bool isScreenSleeping = false; // 画面スリープ状態（画面描画・バックライトOFF）
 
 // Wi-Fi切断時に毎ループで再接続し、CPU負荷やログ出力が増えることを防ぐ
 unsigned long lastWiFiReconnectMillis = 0;
@@ -85,6 +93,10 @@ const unsigned long SEND_INTERVAL = 10000; // 計測データのサーバへの�
 // Wi-Fi切断中の再接続試行間隔 [ms]（画面・センシング処理を阻害しないよう間隔を空ける）
 const unsigned long WIFI_RECONNECT_INTERVAL = 5000;
 
+portMUX_TYPE deviceNameMux = portMUX_INITIALIZER_UNLOCKED;
+char activeDeviceId[32] = DEVICE_ID;
+BLEAdvertising* pAdvertising;
+
 // ======================================================
 // 児童ID・BLEデバイス管理
 // ======================================================
@@ -98,6 +110,100 @@ String getApiBaseUrl() {
         url = url.substring(0, pathPos);
 
     return url;
+}
+
+String urlEncode(const String& value) {
+    static const char hex[] = "0123456789ABCDEF";
+    String encoded;
+    encoded.reserve(value.length() * 3);
+
+    for (size_t i = 0; i < value.length(); i++) {
+        uint8_t byte = static_cast<uint8_t>(value[i]);
+        if ((byte >= 'a' && byte <= 'z') ||
+            (byte >= 'A' && byte <= 'Z') ||
+            (byte >= '0' && byte <= '9') ||
+            byte == '-' || byte == '_' || byte == '.' || byte == '~') {
+            encoded += static_cast<char>(byte);
+        } else {
+            encoded += '%';
+            encoded += hex[byte >> 4];
+            encoded += hex[byte & 0x0F];
+        }
+    }
+    return encoded;
+}
+
+void getActiveDeviceId(char* buffer, size_t bufferSize) {
+    portENTER_CRITICAL(&deviceNameMux);
+    strlcpy(buffer, activeDeviceId, bufferSize);
+    portEXIT_CRITICAL(&deviceNameMux);
+}
+
+String getActiveDeviceId() {
+    char deviceId[sizeof(activeDeviceId)];
+    getActiveDeviceId(deviceId, sizeof(deviceId));
+    return String(deviceId);
+}
+
+// 名札名をサーバーから取得し、BLE名を更新する
+bool updateDeviceNameFromServer() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    String url = AUTO_UPDATE_SERVER_URL;
+    while (url.endsWith("/")) url.remove(url.length() - 1);
+    url += "/api/name";
+
+    HTTPClient http;
+    http.setTimeout(3000);
+    if (!http.begin(url)) {
+        Serial.println("Name update HTTP begin failed.");
+        return false;
+    }
+    http.addHeader("Accept", "application/json");
+
+    int responseCode = http.GET();
+    if (responseCode != 200) {
+        Serial.printf("Name update HTTP response: %d\n", responseCode);
+        http.end();
+        return false;
+    }
+
+    JsonDocument response;
+    DeserializationError error = deserializeJson(response, http.getStream());
+    http.end();
+    if (error) {
+        Serial.printf("Name update JSON parse failed: %s\n", error.c_str());
+        return false;
+    }
+
+    const char* name = response["name"];
+    if (name == nullptr || name[0] == '\0') return true;
+    if (strlen(name) > AUTO_UPDATE_NAME_MAX_BYTES) {
+        Serial.println("Name update ignored: name exceeds BLE advertising limit.");
+        return false;
+    }
+    for (const unsigned char* character = (const unsigned char*)name; *character; character++) {
+        if (*character < 32 || *character == 127) {
+            Serial.println("Name update ignored: name contains control characters.");
+            return false;
+        }
+    }
+
+    String newDeviceId = "NODE_";
+    newDeviceId += name;
+    if (newDeviceId == getActiveDeviceId()) return true;
+
+    portENTER_CRITICAL(&deviceNameMux);
+    strlcpy(activeDeviceId, newDeviceId.c_str(), sizeof(activeDeviceId));
+    portEXIT_CRITICAL(&deviceNameMux);
+
+    BLEAdvertisementData advertisementData;
+    advertisementData.setName(newDeviceId.c_str());
+    pAdvertising->stop();
+    pAdvertising->setAdvertisementData(advertisementData);
+    pAdvertising->start();
+    Serial.println("Device name updated from server.");
+    return true;
 }
 
 // 児童名から対応するID値をDB検索して取得する関数
@@ -116,7 +222,7 @@ int getChildId(const String& deviceName) {
 
     // IDを取得するAPIのURLを作成する
     String url = getApiBaseUrl();
-    url += "/api/children/search?name=" + name;
+    url += "/api/children/search?name=" + urlEncode(name);
 
     Serial.println("Child ID search:");
     Serial.println("  name = " + name);
@@ -203,7 +309,6 @@ float calculateDistance(int rssi) {
 }
 
 BLEScan* pBLEScan;
-BLEAdvertising* pAdvertising;
 TaskHandle_t bleTaskHandle;
 TaskHandle_t sendTaskHandle;
 portMUX_TYPE sharedStateMux = portMUX_INITIALIZER_UNLOCKED;
@@ -253,7 +358,7 @@ class MyCallbacks : public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice device) {
         String name = device.getName().c_str();
 
-        if (!name.startsWith("NODE") || name == DEVICE_ID)
+        if (!name.startsWith("NODE") || name == getActiveDeviceId())
             return;
 
         int rssi = device.getRSSI();
@@ -375,17 +480,38 @@ void initSDCard() {
 }
 
 // NTPによる時刻同期
-void syncTimeWithNTP() {
-    configTime(9 * 3600, 0, "ntp.nict.jp", "time.google.com"); // JST（UTC+9）で同期
+// 2024-01-01以降なら同期済みとみなす（未同期の場合は1970年付近になる）
+bool isTimeSynced() {
+    return time(nullptr) > 1704067200;
+}
 
-    struct tm timeinfo;
+// 同期できるまでサーバを切り替えながら再試行し、成功したらtrueを返す
+bool syncTimeWithNTP() {
+    const int NTP_MAX_ATTEMPTS = 12;
+    const char* servers[][2] = {
+        {"ntp.nict.jp", "time.google.com"},
+        {"time.google.com", "pool.ntp.org"},
+    };
 
-    if (getLocalTime(&timeinfo, 5000)) {
-        // 最大5秒待つ
-        Serial.println("NTP time synced");
-    } else {
-        Serial.println("NTP time sync failed");
+    for (int attempt = 0; attempt < NTP_MAX_ATTEMPTS; attempt++) {
+        if (WiFi.status() != WL_CONNECTED) {
+            delay(1000);
+            continue;
+        }
+
+        const char** pair = servers[attempt % 2];
+        configTime(9 * 3600, 0, pair[0], pair[1]); // JST（UTC+9）で同期
+
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo, 5000) && isTimeSynced()) {
+            Serial.println("NTP time synced");
+            return true;
+        }
+
+        Serial.printf("NTP time sync failed (%d/%d)\n", attempt + 1, NTP_MAX_ATTEMPTS);
     }
+
+    return false;
 }
 
 // 計測開始時刻を取得する関数
@@ -401,6 +527,12 @@ void getStartTime(char* buffer, size_t size) {
 
 // CSVバッファを初期化する関数（最初に一度呼ばれる）
 void createNewCSVFile() {
+    // 計測開始時刻はSDの有無に関わらずサーバ送信にも必要
+    getStartTime(measurementStartTime, sizeof(measurementStartTime));
+    distanceColumnCount = 0;
+    csvSampleCount = 0;
+    startWritten = false;
+
     // SD未装着・初期化失敗時は計測とネットワーク送信を継続し、CSVの保存処理だけ停止
     if (!sdCardMounted) return;
 
@@ -411,13 +543,7 @@ void createNewCSVFile() {
             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
             t->tm_hour, t->tm_min, t->tm_sec);
 
-    // 計測開始時刻を取得する
-    getStartTime(measurementStartTime, sizeof(measurementStartTime));
-
-    distanceColumnCount = 0;
-    csvSampleCount = 0;
-    startWritten = false;
-
+    // 計測開始時刻はファイル名と同じ時刻
     File file = SD.open(csvFileName, FILE_WRITE);
     if (!file) {
         Serial.println("CSV file creation failed.");
@@ -640,9 +766,6 @@ bool addDistanceColumn(int childId) {
 
 // 新たに検出された児童がいるかどうかを確認する関数
 void updateDistanceColumns() {
-    // Distance列の追加はファイル更新を伴うため、SDが利用できる場合だけ実行する
-    if (!sdCardMounted) return;
-
     DeviceInfo snapshot[20];
     int count;
 
@@ -675,7 +798,7 @@ void updateDistanceColumns() {
 
 // 現時点での計測データからCSVバッファ（SD保存用・サーバ送信用）を更新する関数
 void saveDataToCSV() {
-    updateDistanceColumns(); // 現状の相対距離測定の相手デバイスを確認する（SD未マウント時は列追加のみスキップされる）
+    updateDistanceColumns(); // 現状の相対距離測定の相手デバイスを確認する（SD未マウント時も送信用バッファに列追加が反映される）
 
     // ======================================================
     // この時点で必要な分のCSVのカラムは用意は完了済み
@@ -956,9 +1079,24 @@ void sendCSVBufferToServer(int ownChildId) {
     recordServerSendResult(httpResponseCode == 200, consecutiveCsvSendFailures, "CSV");
 }
 
+// バッテリー残量(%)を取得する関数
+// 12%付近で電源が切れてしまうため、12%〜100%を0%〜100%に補正する
+int getBatteryLevel() {
+    int raw = M5.Power.getBatteryLevel();
+    if (raw < 0 || raw > 100) {
+        return raw;
+    }
+    const int BATTERY_CUTOFF_PERCENT = 12;
+    if (raw <= BATTERY_CUTOFF_PERCENT) {
+        return 0;
+    }
+    int adjusted = (int)round((raw - BATTERY_CUTOFF_PERCENT) * 100.0 / (100.0 - BATTERY_CUTOFF_PERCENT));
+    return constrain(adjusted, 0, 100);
+}
+
 // M5のバッテリー残量とWi-Fi RSSIをサーバへ送信する関数
 void sendDeviceStatusToServer(int ownChildId) {
-    int battery = M5.Power.getBatteryLevel();
+    int battery = getBatteryLevel();
     if (battery < 0 || battery > 100) {
         Serial.println("Invalid battery level; device status was not sent.");
         recordServerSendResult(false, consecutiveStatusSendFailures, "Device status");
@@ -1009,7 +1147,7 @@ void sendTask(void *arg)
             bool hasCsvData = hasPendingSendData();
             if (WiFi.status() == WL_CONNECTED) {
                 resolveDeviceChildIds(); // Wi-Fi接続がされていたらサーバ側と同期させる
-                ownChildId = getChildId(DEVICE_ID);
+                ownChildId = getChildId(getActiveDeviceId());
                 if (ownChildId > 0) {
                     sendDeviceStatusToServer(ownChildId);
                 } else if (!hasCsvData) {
@@ -1030,6 +1168,9 @@ void sendTask(void *arg)
 // UI描画処理
 // ======================================================
 
+int oldStepUI = -1;
+int oldBatteryUI = -1;
+
 // UI初期描画
 void drawUIBase() {
     M5.Display.fillScreen(BLACK);
@@ -1039,7 +1180,8 @@ void drawUIBase() {
     // デバイス名
     M5.Display.setTextSize(5);
     M5.Display.setCursor(20, 20);
-    M5.Display.println(String(DEVICE_ID).substring(5)); // NODE_の部分は削って表示させる
+    String deviceId = getActiveDeviceId();
+    M5.Display.println(deviceId.startsWith("NODE_") ? deviceId.substring(5) : deviceId);
 
     // STEPのラベル
     M5.Display.setTextSize(3);
@@ -1049,13 +1191,11 @@ void drawUIBase() {
 
 // STEP部分のUI更新
 void updateStepUI() {
-    static int oldStep = -1;
-
     // 表示する値が変わっていない場合は更新する必要がない
-    if (oldStep == stepCount)
+    if (oldStepUI == stepCount)
         return;
 
-    oldStep = stepCount; // 以前の値を覚えておく
+    oldStepUI = stepCount; // 以前の値を覚えておく
 
     // 数字だけ消す
     M5.Display.fillRect(120, 90, 120, 30, BLACK);
@@ -1105,19 +1245,17 @@ void updateDistanceUI() {
 
 // Battery部分のUI更新
 void updateBatteryUI() {
-    static int oldBattery = -1;
-
-    int battery = M5.Power.getBatteryLevel();
+    int battery = getBatteryLevel();
 
     // 取得失敗（-1などの無効値）は無視して、前回表示を維持する
     if (battery < 0)
         return;
     
     // 表示する値が変わっていない場合は更新する必要がない
-    if (battery == oldBattery)
+    if (battery == oldBatteryUI)
         return;
 
-    oldBattery = battery; // 以前の値を覚えておく
+    oldBatteryUI = battery; // 以前の値を覚えておく
 
     const int x = M5.Display.width() - 160;
     const int y = M5.Display.height() - 30;
@@ -1137,6 +1275,30 @@ void drawUI() {
     updateStepUI();
     updateDistanceUI();
     updateBatteryUI();
+}
+
+// 画面スリープ（バックライト消灯・描画停止）
+void sleepScreen() {
+    if (isScreenSleeping)
+        return;
+    isScreenSleeping = true;
+    M5.Display.sleep();
+    M5.Display.setBrightness(0);
+    Serial.println("Screen sleep activated.");
+}
+
+// 画面復帰（バックライト点灯・UI再描画）
+void wakeupScreen() {
+    if (!isScreenSleeping)
+        return;
+    isScreenSleeping = false;
+    M5.Display.wakeup();
+    M5.Display.setBrightness(40);
+    drawUIBase();
+    oldStepUI = -1;
+    oldBatteryUI = -1;
+    drawUI();
+    Serial.println("Screen wakeup activated.");
 }
 
 // ======================================================
@@ -1202,7 +1364,12 @@ void setup() {
         M5.Lcd.print("IP address = ");
         M5.Lcd.println(WiFi.localIP()); // デバイスのローカルIPアドレスを表示
 
-        syncTimeWithNTP(); // Wi-Fi接続時のみ時刻同期
+        // 計測開始時刻が空にならないよう、同期できるまで再試行する
+        M5.Lcd.println("NTP syncing...");
+        while (!syncTimeWithNTP()) {
+            M5.Lcd.println("NTP retry...");
+        }
+        updateDeviceNameFromServer(); // Wi-Fi接続後に名札名を同期
     } else {
         M5.Lcd.fillScreen(BLACK);
         M5.Lcd.println("WiFi Timeout"); // Wi-Fi接続タイムアウト
@@ -1213,6 +1380,9 @@ void setup() {
 
     drawUIBase(); // UIの初期描画
     updateBatteryUI(); // 初回のバッテリー残量を表示
+
+    lastScreenTouchMillis = millis();
+    isScreenSleeping = false;
 }
 
 // ======================================================
@@ -1223,10 +1393,47 @@ unsigned long lastUI = 0; // 画面更新頻度のパラメータ
 
 // メインループ処理
 void loop() {
+    M5.update(); // タッチ・ボタン状態の更新
+
+    unsigned long now = millis();
+
+    // 画面タップ・操作の検知（CoreS3画面タッチ・仮想ボタン）
+    bool isTouched = (M5.Touch.getCount() > 0) ||
+                     M5.Touch.getDetail().wasClicked() ||
+                     M5.Touch.getDetail().wasPressed() ||
+                     M5.BtnPWR.wasClicked() ||
+                     M5.BtnA.wasPressed() ||
+                     M5.BtnB.wasPressed() ||
+                     M5.BtnC.wasPressed();
+
+    if (isTouched) {
+        if (isScreenSleeping) {
+            wakeupScreen();
+        }
+        lastScreenTouchMillis = now;
+    }
+
+    // 30秒間操作がなければ画面をスリープ
+    if (!isScreenSleeping && (now - lastScreenTouchMillis >= SCREEN_SLEEP_TIMEOUT_MS)) {
+        sleepScreen();
+    }
+
     updateSensors(); // センシングした値を更新
     updateStepCount(); // 最新のセンシング値から歩数を計算して更新
 
-    unsigned long now = millis();
+    static char lastDisplayedDeviceId[sizeof(activeDeviceId)] = DEVICE_ID;
+    char currentDeviceId[sizeof(activeDeviceId)];
+    getActiveDeviceId(currentDeviceId, sizeof(currentDeviceId));
+    if (strcmp(lastDisplayedDeviceId, currentDeviceId) != 0) {
+        if (!isScreenSleeping) {
+            drawUIBase();
+            oldStepUI = -1;
+            oldBatteryUI = -1;
+            drawUI();
+        }
+        strlcpy(lastDisplayedDeviceId, currentDeviceId, sizeof(lastDisplayedDeviceId));
+        lastUI = 0;
+    }
 
     // 一定時間周期でCSVバッファを更新
     if (now - lastCSVMillis >= CSV_INTERVAL) {
@@ -1246,9 +1453,11 @@ void loop() {
         lastSendMillis = now;
     }
 
-    // 一定時間周期で画面更新
+    // 一定時間周期で画面更新（スリープ中は描画スキップ）
     if (now - lastUI > UI_UPDATE_MS) { 
-        drawUI(); // 必要な部分だけ数値の表示を更新する
+        if (!isScreenSleeping) {
+            drawUI(); // 必要な部分だけ数値の表示を更新する
+        }
         lastUI = now;
     }
 
