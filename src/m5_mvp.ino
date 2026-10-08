@@ -41,7 +41,7 @@
 
 // 対応する児童の名前（デバイスごとに変える、NODE_のプレフィックスが必須）
 // 名前の重複が無いように基本的にフルネームで登録することとする
-#define DEVICE_ID "NODE_TEST"
+#define DEVICE_ID "NODE_TESUTO"
 #define AUTO_UPDATE_NAME_MAX_BYTES 24
 
 #define CSV_BUFFER_SIZE 8192 // CSVバッファのサイズ
