@@ -479,39 +479,23 @@ void initSDCard() {
     Serial.println("SD card initialized");
 }
 
-// NTPによる時刻同期
-// 2024-01-01以降なら同期済みとみなす（未同期の場合は1970年付近になる）
-bool isTimeSynced() {
-    return time(nullptr) > 1704067200;
-}
+// インターネット非接続環境向け: NTPは使わず、システム時刻を固定値
+// 2026-10-10 09:30:00 JST に設定する
+void setFixedTime() {
+    setenv("TZ", "JST-9", 1);
+    tzset();
 
-// 同期できるまでサーバを切り替えながら再試行し、成功したらtrueを返す
-bool syncTimeWithNTP() {
-    const int NTP_MAX_ATTEMPTS = 12;
-    const char* servers[][2] = {
-        {"ntp.nict.jp", "time.google.com"},
-        {"time.google.com", "pool.ntp.org"},
-    };
+    struct tm t = {};
+    t.tm_year = 2026 - 1900;
+    t.tm_mon = 10 - 1;
+    t.tm_mday = 10;
+    t.tm_hour = 9;
+    t.tm_min = 30;
+    t.tm_sec = 0;
+    t.tm_isdst = 0;
 
-    for (int attempt = 0; attempt < NTP_MAX_ATTEMPTS; attempt++) {
-        if (WiFi.status() != WL_CONNECTED) {
-            delay(1000);
-            continue;
-        }
-
-        const char** pair = servers[attempt % 2];
-        configTime(9 * 3600, 0, pair[0], pair[1]); // JST（UTC+9）で同期
-
-        struct tm timeinfo;
-        if (getLocalTime(&timeinfo, 5000) && isTimeSynced()) {
-            Serial.println("NTP time synced");
-            return true;
-        }
-
-        Serial.printf("NTP time sync failed (%d/%d)\n", attempt + 1, NTP_MAX_ATTEMPTS);
-    }
-
-    return false;
+    struct timeval tv = {mktime(&t), 0};
+    settimeofday(&tv, nullptr);
 }
 
 // 計測開始時刻を取得する関数
@@ -1345,6 +1329,8 @@ void setup() {
     xTaskCreatePinnedToCore(bleTask, "BLE", 4096, NULL, 2, &bleTaskHandle, 1);
     xTaskCreatePinnedToCore(sendTask, "SEND", 8192, NULL, 1, &sendTaskHandle, 0);
 
+    setFixedTime(); // NTPなしで計測開始時刻を固定
+
     // Wi-Fiへの接続を行う
     WiFi.begin(WIFI_SSID, WIFI_PASS);
 
@@ -1364,11 +1350,6 @@ void setup() {
         M5.Lcd.print("IP address = ");
         M5.Lcd.println(WiFi.localIP()); // デバイスのローカルIPアドレスを表示
 
-        // 計測開始時刻が空にならないよう、同期できるまで再試行する
-        M5.Lcd.println("NTP syncing...");
-        while (!syncTimeWithNTP()) {
-            M5.Lcd.println("NTP retry...");
-        }
         updateDeviceNameFromServer(); // Wi-Fi接続後に名札名を同期
     } else {
         M5.Lcd.fillScreen(BLACK);
