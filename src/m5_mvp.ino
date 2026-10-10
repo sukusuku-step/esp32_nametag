@@ -11,7 +11,7 @@
 #include "cert.h"
 
 #ifndef AUTO_UPDATE_SERVER_URL
-#define AUTO_UPDATE_SERVER_URL "http://10.172.66.7:8000"
+#define AUTO_UPDATE_SERVER_URL "http://192.168.112.1:8000"
 #endif
 
 // ======================================================
