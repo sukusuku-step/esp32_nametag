@@ -480,7 +480,7 @@ void initSDCard() {
 }
 
 // インターネット非接続環境向け: NTPは使わず、システム時刻を固定値
-// 2026-10-10 09:30:00 JST に設定する
+// 2026-10-11 09:30:00 JST に設定する
 void setFixedTime() {
     setenv("TZ", "JST-9", 1);
     tzset();
@@ -488,7 +488,7 @@ void setFixedTime() {
     struct tm t = {};
     t.tm_year = 2026 - 1900;
     t.tm_mon = 10 - 1;
-    t.tm_mday = 10;
+    t.tm_mday = 11;
     t.tm_hour = 9;
     t.tm_min = 30;
     t.tm_sec = 0;
