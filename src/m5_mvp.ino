@@ -65,7 +65,7 @@ volatile float distanceMeter = -1;
 int distanceChildIds[MAX_DISTANCE_COLUMNS];
 int distanceColumnCount = 0;
 
-unsigned long csvSampleCount = 0;^
+unsigned long csvSampleCount = 0;
 bool startWritten = false;
 
 char measurementStartTime[32] = ""; // 計測開始時刻
