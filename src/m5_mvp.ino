@@ -11,7 +11,7 @@
 #include "cert.h"
 
 #ifndef AUTO_UPDATE_SERVER_URL
-#define AUTO_UPDATE_SERVER_URL "http://192.168.112.1:8000"
+#define AUTO_UPDATE_SERVER_URL "http://192.168.11.5:8000"
 #endif
 
 // ======================================================
@@ -65,7 +65,7 @@ volatile float distanceMeter = -1;
 int distanceChildIds[MAX_DISTANCE_COLUMNS];
 int distanceColumnCount = 0;
 
-unsigned long csvSampleCount = 0;
+unsigned long csvSampleCount = 0;^
 bool startWritten = false;
 
 char measurementStartTime[32] = ""; // 計測開始時刻
